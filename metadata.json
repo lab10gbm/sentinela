@@ -1,0 +1,5 @@
+{
+  "name": "Sentinela",
+  "description": "Uma ferramenta inteligente para o 10º GBM que analisa documentos oficiais (PDF) e identifica menções relevantes a Angra dos Reis e militares da unidade baseada em uma planilha de efetivo.",
+  "requestFramePermissions": []
+}
