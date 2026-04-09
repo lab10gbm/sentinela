@@ -102,3 +102,14 @@ export interface StoredBulletin {
   dateProcessed: string;
   notas: BulletinNota[];
 }
+
+/** Nota salva manualmente pelo usuário para análise de qualidade */
+export interface SavedNota {
+  id: string;
+  notaId: string;
+  notaTitle: string;
+  notaContent: string;
+  bulletinFilename: string;
+  savedAt: string;
+  observation?: string;
+}

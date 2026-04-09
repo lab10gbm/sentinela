@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { BulletinNota, TableData, StoredBulletin, MilitaryPerson, SearchPreferences } from '../types';
-import { BookOpen, ChevronRight, Copy, Check, FileText, Download, Table, ArrowLeft, Calendar, Trash2, Star } from 'lucide-react';
+import { BookOpen, ChevronRight, Copy, Check, FileText, Download, Table, ArrowLeft, Calendar, Trash2, Star, Bookmark } from 'lucide-react';
 import SumarioView from './SumarioView';
 import * as XLSX from 'xlsx';
 import { normalizeTitle } from '../services/textUtils';
@@ -21,6 +21,10 @@ interface NotasViewProps {
   onNavigateComplete?: () => void;
   personnel?: MilitaryPerson[];
   searchPrefs?: SearchPreferences;
+  /** Callback para salvar nota no painel de análise */
+  onSaveNota?: (nota: BulletinNota) => void;
+  /** Verifica se uma nota já foi salva */
+  isNotaSaved?: (notaId: string) => boolean;
 }
 
 /**
@@ -453,6 +457,8 @@ const NotasView: React.FC<NotasViewProps> = ({
   onNavigateComplete,
   personnel,
   searchPrefs,
+  onSaveNota,
+  isNotaSaved,
 }) => {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
@@ -844,6 +850,19 @@ const NotasView: React.FC<NotasViewProps> = ({
             </h4>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0 pl-2" onClick={e => e.stopPropagation()}>
+            {onSaveNota && (
+              <button
+                onClick={() => onSaveNota(nota)}
+                title={isNotaSaved?.(nota.id) ? 'Já salva' : 'Salvar para análise'}
+                className={`p-1.5 rounded-lg border transition-all ${
+                  isNotaSaved?.(nota.id)
+                    ? 'bg-orange-100 text-orange-500 border-orange-200'
+                    : 'bg-white text-gray-300 hover:text-orange-500 border-gray-200 hover:border-orange-200 hover:bg-orange-50'
+                }`}
+              >
+                <Bookmark className={`w-3.5 h-3.5 ${isNotaSaved?.(nota.id) ? 'fill-orange-400' : ''}`} />
+              </button>
+            )}
             <button
               onClick={() => handleCopy(nota)}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${

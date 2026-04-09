@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from 'react';
-import { Shield, FileText, Users, Search, AlertTriangle, Download, Settings, ChevronDown, ChevronRight, ChevronLeft, Menu, Target, ToggleLeft, ToggleRight, X, Type, Minus, Plus, AlignJustify, AlignLeft, Database, Trash2, Eye, HardDrive, EyeOff, Bot, MessageSquare, RotateCcw, Cloud } from 'lucide-react';
+import { Shield, FileText, Users, Search, AlertTriangle, Download, Settings, ChevronDown, ChevronRight, ChevronLeft, Menu, Target, ToggleLeft, ToggleRight, X, Type, Minus, Plus, AlignJustify, AlignLeft, Database, Trash2, Eye, HardDrive, EyeOff, Bot, MessageSquare, RotateCcw, Cloud, Bookmark } from 'lucide-react';
 import FileUploader from '../components/FileUploader';
 import ResultsView from '../components/ResultsView';
 import KeywordManager from '../components/KeywordManager';
@@ -19,6 +19,8 @@ import { auditLocalAnalysis } from '../services/geminiService';
 import { analyzeDocumentLocal } from '../services/localSearchService';
 import { useBulletinPipeline } from '../hooks/useBulletinPipeline';
 import { useRoster } from '../hooks/useRoster';
+import { useSavedNotas } from '../hooks/useSavedNotas';
+import SavedNotasPanel from '../components/SavedNotasPanel';
 import * as XLSX from 'xlsx';
 
 const STORAGE_KEY_KEYWORDS = 'SENTINELA_KEYWORDS';
@@ -31,7 +33,7 @@ const DEFAULT_KEYWORDS = [
 
 const DEFAULT_CONTEXTS = ['todas as unidades', 'BOLETIM RESERVADO'];
 
-type TabType = 'report' | 'database' | 'pdf';
+type TabType = 'report' | 'database' | 'pdf' | 'saved';
 
 function App() {
   const {
@@ -44,6 +46,8 @@ function App() {
     isHistoryLoaded, pageMap, setPageMap, state, setState,
     loadHistory, runBulletinExtraction, deleteBulletin, resetBulletin,
   } = useBulletinPipeline();
+
+  const { savedNotas, saveNota, removeNota, updateObservation, isSaved } = useSavedNotas();
 
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [results, setResults] = useState<ExtractionResult[]>([]);
@@ -898,6 +902,24 @@ function App() {
                               </button>
                             </div>
                           )}
+
+                          {/* SAVED NOTAS TAB HEADER */}
+                          <div className="flex-1 relative min-w-[150px]">
+                            <button
+                              onClick={() => { setActiveTab('saved'); if (!openTabs.includes('saved')) setOpenTabs(prev => [...prev, 'saved']); }}
+                              className={`w-full h-full py-4 text-sm font-bold uppercase tracking-wider flex items-center justify-center gap-2 transition-colors
+                                  ${activeTab === 'saved' ? 'bg-white text-orange-700 border-b-2 border-b-orange-500' : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'}
+                              `}
+                            >
+                              <Bookmark className="w-4 h-4" />
+                              Notas Salvas
+                              {savedNotas.length > 0 && (
+                                <span className="bg-orange-100 text-orange-600 text-[10px] px-2 py-0.5 rounded-full font-black">
+                                  {savedNotas.length}
+                                </span>
+                              )}
+                            </button>
+                          </div>
                         </div>
 
                         {/* --- TAB CONTENT AREA --- */}
@@ -926,6 +948,14 @@ function App() {
                                                   onNavigateComplete={() => setNavigateTo(null)}
                                                   personnel={personnel}
                                                   searchPrefs={searchPrefs}
+                                                  onSaveNota={(nota) => {
+                                                    const filename = bulletinHistory.find(b => b.id === selectedBulletinId)?.filename || 'boletim';
+                                                    saveNota(nota, filename);
+                                                  }}
+                                                  isNotaSaved={(notaId) => {
+                                                    const filename = bulletinHistory.find(b => b.id === selectedBulletinId)?.filename || 'boletim';
+                                                    return isSaved(notaId, filename);
+                                                  }}
                                               />
                                           </div>
                                           <div className={`hidden lg:flex lg:flex-col ${isPdfMaximized ? 'lg:col-span-12' : 'lg:col-span-5'} border-l border-gray-200 relative group`}>
@@ -1107,6 +1137,26 @@ function App() {
                                   </p>
                                 </div>
                               )}
+                            </div>
+                          )}
+
+                          {/* SAVED NOTAS TAB CONTENT */}
+                          {activeTab === 'saved' && (
+                            <div className="overflow-y-auto p-6 bg-gray-50/30" style={{ minHeight: 'calc(100vh - 8rem)' }}>
+                              <div className="max-w-3xl mx-auto">
+                                <div className="flex items-center gap-2 mb-6">
+                                  <Bookmark className="w-5 h-5 text-orange-500" />
+                                  <h2 className="text-lg font-black text-gray-800">Notas Salvas para Análise</h2>
+                                </div>
+                                <p className="text-xs text-gray-500 mb-6 bg-orange-50 border border-orange-100 rounded-lg px-4 py-3">
+                                  Use este espaço para guardar notas com problemas de formatação. Adicione observações para identificar padrões e melhorar o detector.
+                                </p>
+                                <SavedNotasPanel
+                                  savedNotas={savedNotas}
+                                  onRemove={removeNota}
+                                  onUpdateObservation={updateObservation}
+                                />
+                              </div>
                             </div>
                           )}
                         </div>
