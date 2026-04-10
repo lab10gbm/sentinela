@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { BulletinNota, TableData, StoredBulletin, MilitaryPerson, SearchPreferences } from '../types';
-import { BookOpen, ChevronRight, Copy, Check, FileText, Download, Table, ArrowLeft, Calendar, Trash2, Star, Bookmark } from 'lucide-react';
+import { BookOpen, ChevronRight, Copy, Check, FileText, Download, Table, ArrowLeft, Calendar, Trash2, Star, Bookmark, X, AlertCircle } from 'lucide-react';
 import SumarioView from './SumarioView';
 import * as XLSX from 'xlsx';
 import { normalizeTitle } from '../services/textUtils';
@@ -21,10 +21,12 @@ interface NotasViewProps {
   onNavigateComplete?: () => void;
   personnel?: MilitaryPerson[];
   searchPrefs?: SearchPreferences;
-  /** Callback para salvar nota no painel de análise */
+  /** Callback para salvar nota como relevante */
   onSaveNota?: (nota: BulletinNota) => void;
-  /** Verifica se uma nota já foi salva */
-  isNotaSaved?: (notaId: string) => boolean;
+  /** Callback para salvar nota como erro de detecção/formatação */
+  onSaveError?: (nota: BulletinNota) => void;
+  /** Verifica se uma nota já foi salva em certa categoria */
+  isNotaSaved?: (notaId: string, category?: 'error' | 'relevant') => boolean;
 }
 
 /**
@@ -108,7 +110,8 @@ const StructuredTable: React.FC<{
           const bg = ri === 0 ? 'background:#f3f4f6;font-weight:bold;' : '';
           const content = cell.text
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-            .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+            .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+            .replace(/!\[(.*?)\]\((.*?)\)/g, '<img src="$2" alt="$1" style="max-height: 44px; display: block; margin: 4px auto;" />');
           return `<td style="padding:4px 8px;border:1px solid black;${bg}">${content}</td>`;
         }).join('')}</tr>`
       ).join('')
@@ -304,11 +307,12 @@ const renderParagraphs = (
     elements.push(
       <p 
         key={`p-${idx}`}
-        className={`leading-relaxed mb-1 text-gray-800 ${isCentered ? 'text-center' : 'indent-8 text-justify'}`}
+        className={`leading-relaxed mb-1 text-gray-800 ${isCentered ? 'text-center' : 'indent-8'}`}
         style={{ 
           fontFamily: "'Segoe UI', system-ui, sans-serif",
           fontSize: '12px',
           lineHeight: 1.6,
+          textAlign: isCentered ? 'center' : 'justify',
         }}
         dangerouslySetInnerHTML={{ __html: html }}
       />
@@ -425,11 +429,12 @@ const renderParagraphs = (
         elements.push(
           <p 
             key={`h-${i}`}
-            className={`leading-relaxed mb-1 text-gray-900 ${isHeaderLine ? 'font-semibold' : ''} ${isCentered ? 'text-center' : 'indent-8 text-justify'}`}
+            className={`leading-relaxed mb-1 text-gray-900 ${isHeaderLine ? 'font-semibold' : ''} ${isCentered ? 'text-center' : 'indent-8'}`}
             style={{ 
               fontFamily: "'Segoe UI', system-ui, sans-serif",
               fontSize: '12px',
               lineHeight: 1.6,
+              textAlign: isCentered ? 'center' : 'justify',
             }}
             dangerouslySetInnerHTML={{ __html: lineHtml }}
           />
@@ -458,6 +463,7 @@ const NotasView: React.FC<NotasViewProps> = ({
   personnel,
   searchPrefs,
   onSaveNota,
+  onSaveError,
   isNotaSaved,
 }) => {
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -684,6 +690,7 @@ const NotasView: React.FC<NotasViewProps> = ({
       .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
       .replace(/(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)/g, '<i>$1</i>')
       .replace(/<u>(.*?)<\/u>/gi, '<u>$1</u>')
+      .replace(/!\[(.*?)\]\((.*?)\)/g, '<img src="$2" alt="$1" style="max-width: 55%; display: block; margin: 10px auto;" />')
       // Tabelas (Simuladas como grids simples se for grid-tab)
       .replace(/```grid-tab-(\d+)\n([\s\S]*?)```/g, (_, tabIdxStr, content) => {
           const tabIdx = parseInt(tabIdxStr, 10);
@@ -837,6 +844,11 @@ const NotasView: React.FC<NotasViewProps> = ({
             <Star className="w-3.5 h-3.5 fill-amber-900" /> FAVORITO
           </div>
         )}
+        {nota.hasFuzzyMatch && (
+          <div className="absolute top-0 left-0 bg-purple-600 text-white text-[9px] font-black px-3 py-1 rounded-br-lg shadow-sm z-10 flex items-center gap-1 animate-pulse">
+            <AlertCircle className="w-3 h-3" /> VERIFICAR NOME
+          </div>
+        )}
         <div
           className="bg-gray-50/80 px-4 py-3 border-b border-gray-200 flex items-start gap-3 cursor-pointer hover:bg-gray-100 transition-colors"
           onClick={() => toggleExpand(nota.id)}
@@ -850,17 +862,30 @@ const NotasView: React.FC<NotasViewProps> = ({
             </h4>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0 pl-2" onClick={e => e.stopPropagation()}>
+            {onSaveError && (
+              <button
+                onClick={() => onSaveError(nota)}
+                title={isNotaSaved?.(nota.id, 'error') ? 'Erro já reportado' : 'Reportar erro de formatação (X)'}
+                className={`p-1.5 rounded-lg border transition-all ${
+                  isNotaSaved?.(nota.id, 'error')
+                    ? 'bg-red-100 text-red-500 border-red-200'
+                    : 'bg-white text-gray-300 hover:text-red-500 border-gray-200 hover:border-red-200 hover:bg-red-50'
+                }`}
+              >
+                <X className={`w-3.5 h-3.5 ${isNotaSaved?.(nota.id, 'error') ? 'stroke-[3px]' : ''}`} />
+              </button>
+            )}
             {onSaveNota && (
               <button
                 onClick={() => onSaveNota(nota)}
-                title={isNotaSaved?.(nota.id) ? 'Já salva' : 'Salvar para análise'}
+                title={isNotaSaved?.(nota.id, 'relevant') ? 'Nota já salva' : 'Salvar como relevante'}
                 className={`p-1.5 rounded-lg border transition-all ${
-                  isNotaSaved?.(nota.id)
+                  isNotaSaved?.(nota.id, 'relevant')
                     ? 'bg-orange-100 text-orange-500 border-orange-200'
                     : 'bg-white text-gray-300 hover:text-orange-500 border-gray-200 hover:border-orange-200 hover:bg-orange-50'
                 }`}
               >
-                <Bookmark className={`w-3.5 h-3.5 ${isNotaSaved?.(nota.id) ? 'fill-orange-400' : ''}`} />
+                <Bookmark className={`w-3.5 h-3.5 ${isNotaSaved?.(nota.id, 'relevant') ? 'fill-orange-400' : ''}`} />
               </button>
             )}
             <button

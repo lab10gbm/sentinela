@@ -403,7 +403,9 @@ export const joinWrappedParagraphs = (text: string): string => {
     }
 
     const isHeader = isVisualHeader(current);
-    const endsWithStrongPunctuation = /[.:;!?]$/.test(current);
+    // Remove marcadores de formatação para testar pontuação real
+    const currentPlain = current.replace(/\*\*/g, '').replace(/\*/g, '').trim();
+    const endsWithStrongPunctuation = /[.:;!?]$/.test(currentPlain);
     const isListItem = /^(\d+|[a-z]|[IVX]+)[\s.-]/.test(current);
     const isTableLine = current.includes('|') || current.startsWith('```');
     const isImage = current.includes('![Img]') || current.includes('![Imagem');
