@@ -120,6 +120,26 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
       tokens = ocrResult.tokens.map(t => ({ ...t, page: i }));
       isOcrDerived = true;
     } else {
+      // Primeiro, tenta extrair metadados de fonte via commonObjs (mais confiável que styles)
+      const fontMap = new Map<string, { isBold: boolean; isItalic: boolean }>();
+      
+      // Itera sobre commonObjs para mapear fontName → características reais
+      await Promise.all(
+        Object.keys(textContent.styles).map(async (fontId) => {
+          try {
+            const fontObj = await page.commonObjs.get(fontId);
+            if (fontObj && fontObj.name) {
+              const name = fontObj.name.toLowerCase();
+              const isBold = name.includes('bold') || name.includes('black') || name.includes('heavy');
+              const isItalic = name.includes('italic') || name.includes('oblique');
+              fontMap.set(fontId, { isBold, isItalic });
+            }
+          } catch {
+            // commonObjs.get pode falhar para alguns IDs — ignora
+          }
+        })
+      );
+
       tokens = textContent.items
         .map((item: any) => {
           const transform = item.transform;
@@ -131,16 +151,19 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
           const isBoldByFamily = fontFamily.includes('bold') || fontFamily.includes('black') || fontFamily.includes('heavy');
           const isItalicByFamily = fontFamily.includes('italic') || fontFamily.includes('oblique');
 
-          // Fallback: o ID interno do pdfjs (ex: "BCDHEE+SegoeUI-Bold") contém o nome real após "+"
-          // Cobre casos onde fontFamily não está populado
+          // Fallback 1: o ID interno do pdfjs (ex: "BCDHEE+SegoeUI-Bold") contém o nome real após "+"
           const internalId = (item.fontName || "").toLowerCase();
           const fontNameAfterPlus = internalId.includes('+') ? internalId.split('+')[1] : internalId;
-          // Também cobre "Segoe UI,Bold" (vírgula em vez de hífen — boletins 039 e 051)
           const isBoldByName = fontNameAfterPlus.includes('bold') || fontNameAfterPlus.includes('black') || fontNameAfterPlus.includes('heavy') || internalId.includes(',bold');
           const isItalicByName = fontNameAfterPlus.includes('italic') || fontNameAfterPlus.includes('oblique');
 
-          const isBold = isBoldByFamily || isBoldByName;
-          const isItalic = isItalicByFamily || isItalicByName;
+          // Fallback 2: commonObjs (mais confiável quando styles não tem nome real)
+          const fromCommon = fontMap.get(item.fontName);
+          const isBoldByCommon = fromCommon?.isBold ?? false;
+          const isItalicByCommon = fromCommon?.isItalic ?? false;
+
+          const isBold = isBoldByFamily || isBoldByName || isBoldByCommon;
+          const isItalic = isItalicByFamily || isItalicByName || isItalicByCommon;
 
           // Diagnóstico: loga fontes únicas na primeira página para validação
           if (i === 1 && item.str.trim().length > 0) {
@@ -148,7 +171,8 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
             if (!(extractTextFromPdf as any)._loggedFonts) (extractTextFromPdf as any)._loggedFonts = new Set();
             if (!(extractTextFromPdf as any)._loggedFonts.has(key)) {
               (extractTextFromPdf as any)._loggedFonts.add(key);
-              console.log(`[Sentinela][Font] id="${item.fontName}" family="${fontFamily}" isBold=${isBold} isItalic=${isItalic} sample="${item.str.substring(0,20)}"`);
+              const commonName = fromCommon ? `common="${fontMap.get(item.fontName)}"` : 'common=null';
+              console.log(`[Sentinela][Font] id="${item.fontName}" family="${fontFamily}" ${commonName} isBold=${isBold} isItalic=${isItalic} sample="${item.str.substring(0,20)}"`);
             }
           }
 
