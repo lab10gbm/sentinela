@@ -7,6 +7,7 @@
  */
 
 import { TextToken } from "../types";
+import { calibrationService } from "./calibrationService";
 
 // ──────────────────────────────────────────────
 // TOC (SUMÁRIO) — TIPOS E INTERFACES
@@ -398,14 +399,29 @@ export const joinWrappedParagraphs = (text: string): string => {
     const isListItem = /^(\d+|[a-z]|[IVX]+)[\s.-]/.test(current);
     const isTableLine = current.includes('|') || current.startsWith('```');
     const isImage = current.includes('![Img]') || current.includes('![Imagem');
+    // Linha de dados de militar: contém RG com número, Id Funcional, ou padrão "NOME RG NÚMERO"
+    const isMilitaryDataLine = /\bRG\s+\d/.test(current) || /Id\s*Funcional\s+\d/i.test(current) || /,\s*RG\b/i.test(current);
+
+    // MÁXIMO RIGOR: Se for título (CAIXA ALTA), NUNCA une com a linha de baixo
+    // a menos que a linha de baixo seja minúscula (continuação improvável para títulos)
+    if (isHeader && next && !/^[a-zÀ-ü]/.test(next)) {
+      result.push(current);
+      continue;
+    }
+
+    // Linha de dados de militar nunca é unida com a próxima
+    if (isMilitaryDataLine) {
+      result.push(current);
+      continue;
+    }
 
     if (!endsWithStrongPunctuation && !isListItem && !isTableLine && !isImage && next) {
       const nextIsListItem = /^(\d+|[a-z]|[IVX]+)[\s.-]/.test(next);
       const nextIsTable = next.includes('|') || next.startsWith('```');
       const nextIsImage = next.includes('![Img]') || next.includes('![Imagem');
       const nextIsLower = /^[a-zÀ-ü]/.test(next);
-      // Linha muito curta sem pontuação provavelmente é nome/palavra quebrada
-      const currentIsShortFragment = current.replace(/\*\*/g, '').length < 25 && !endsWithStrongPunctuation;
+      // Fragmento curto: só considera se NÃO for header (evita unir títulos em CAIXA ALTA)
+      const currentIsShortFragment = !isHeader && current.replace(/\*\*/g, '').length < 25 && !endsWithStrongPunctuation;
 
       if (!nextIsListItem && !nextIsTable && !nextIsImage) {
         // Une se: próxima começa com minúscula, OU linha atual é fragmento curto sem pontuação
@@ -413,8 +429,8 @@ export const joinWrappedParagraphs = (text: string): string => {
           lines[i + 1] = current + " " + next;
           continue;
         }
-        // Une também se: linha atual não é header estrutural E próxima não é header estrutural
-        // (cobre nomes próprios em maiúsculo que quebram de linha)
+        
+        // Se as duas linhas são normais (não-header), une (fluxo de parágrafo)
         if (!isHeader && !isVisualHeader(next) && next.length > 0) {
           lines[i + 1] = current + " " + next;
           continue;
@@ -522,8 +538,182 @@ export const stripNumericPrefix = (text: string): string => {
 };
 
 // ──────────────────────────────────────────────
-// DETECÇÃO DE TABELAS
+// RECONSTRUÇÃO GEOMÉTRICA (Next Gen)
 // ──────────────────────────────────────────────
+
+/**
+ * Agrupa tokens em linhas visuais baseadas em coordenadas Y.
+ * Retorna uma lista de linhas, onde cada linha contém seus tokens ordenados por X.
+ */
+export const groupTokensIntoVisualLines = (tokens: TextToken[], yEpsilon?: number) => {
+  const settings = calibrationService.settings;
+  const epsilon = yEpsilon ?? settings.yTolerance;
+  const lines: { y: number; tokens: TextToken[] }[] = [];
+  
+  // Ordena por Y (decrescente para PDF.js, onde Y cresce para baixo ou para cima dependendo do viewport, 
+  // mas aqui assumimos consistência do pdfWorkerService)
+  const sorted = [...tokens].sort((a, b) => b.y - a.y);
+  
+  for (const token of sorted) {
+    const existing = lines.find(l => Math.abs(token.y - l.y) <= epsilon);
+    if (existing) {
+      existing.tokens.push(token);
+    } else {
+      lines.push({ y: token.y, tokens: [token] });
+    }
+  }
+  
+  // Ordena tokens dentro de cada linha por X
+  for (const line of lines) {
+    line.tokens.sort((a, b) => a.x - b.x);
+  }
+  
+  // Ordena as linhas por Y (do topo para baixo)
+  return lines.sort((a, b) => b.y - a.y);
+};
+
+/**
+ * Identifica a "Assinatura de Layout" detectando eixos de alinhamento vertical rítmico.
+ * Útil para diferenciar tabelas de parágrafos justificados.
+ */
+export const detectLayoutSignature = (tokens: TextToken[]): { verticalAxes: number[], isRhythmic: boolean } => {
+  const lines = groupTokensIntoVisualLines(tokens);
+  if (lines.length < 3) return { verticalAxes: [], isRhythmic: false };
+
+  const xStats = new Map<number, number>();
+  const round = (val: number) => Math.round(val / 5) * 5; // Tolerância de 5px
+
+  for (const line of lines) {
+    for (const tok of line.tokens) {
+      const rx = round(tok.x);
+      xStats.set(rx, (xStats.get(rx) || 0) + 1);
+    }
+  }
+
+  // Eixos que aparecem em pelo menos 30% das linhas
+  const threshold = lines.length * 0.3;
+  const verticalAxes = Array.from(xStats.entries())
+    .filter(([_, count]) => count >= threshold)
+    .map(([x]) => x)
+    .sort((a, b) => a - b);
+
+  // É rítmico se tivermos múltiplos eixos verticais consistentes
+  const isRhythmic = verticalAxes.length >= 2;
+
+  return { verticalAxes, isRhythmic };
+};
+
+/**
+ * Reconstrói o texto a partir de tokens usando Gap Analysis (Next Gen).
+ * Abandona a dependência de \n e foca no espaçamento visual.
+ */
+export const reconstructVisualParagraphs = (tokens: TextToken[]): string => {
+  const lines = groupTokensIntoVisualLines(tokens);
+  if (lines.length === 0) return "";
+
+  const resultLines: string[] = [];
+  let currentParagraphLines: string[] = [];
+
+  // Calcula o gap mediano entre linhas para detectar quebras de parágrafo
+  const lineGaps: number[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const gap = lines[i - 1].y - lines[i].y;
+    if (gap > 0 && gap < 100) lineGaps.push(gap);
+  }
+  lineGaps.sort((a, b) => a - b);
+  const medianGap = lineGaps.length > 0 ? lineGaps[Math.floor(lineGaps.length * 2 / 3)] : 12;
+  const paragraphThreshold = medianGap * 1.5;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let lineText = "";
+    
+    // Reconstroi a linha baseada em gaps horizontais
+    for (let j = 0; j < line.tokens.length; j++) {
+      const tok = line.tokens[j];
+      let t = tok.isBold ? `**${tok.text}**` : tok.text;
+      if (tok.isUnderlined) t = `<u>${t}</u>`;
+      
+      lineText += t;
+      
+      if (j < line.tokens.length - 1) {
+        const next = line.tokens[j+1];
+        const gap = next.x - (tok.x + tok.w);
+        if (gap > 30) lineText += "    ";
+        else if (gap > 10) lineText += "  ";
+        else if (gap > 2) lineText += " ";
+      }
+    }
+
+    // Checa por quebra de parágrafo visual
+    if (i > 0) {
+      const vGap = lines[i-1].y - line.y;
+      const isIndented = line.tokens[0].x > (lines[0].tokens[0].x + 20); // Simples heurística de identação
+      
+      if (vGap > paragraphThreshold || isIndented) {
+        resultLines.push(currentParagraphLines.join(" "));
+        currentParagraphLines = [];
+      }
+    }
+    
+    currentParagraphLines.push(lineText.trim());
+  }
+
+  if (currentParagraphLines.length > 0) {
+    resultLines.push(currentParagraphLines.join(" "));
+  }
+
+  return resultLines.join("\n\n");
+};
+
+
+/**
+ * Detecta linhas que são DEFINITIVAMENTE parágrafos legais/narrativos (nunca tabela).
+ */
+export const isHardLegalParagraph = (text: string): boolean => {
+  const plain = text.trim().replace(/\*\*/g, '');
+  return (
+    // Numeração hierárquica de documento (1.1., 1.1.1.)
+    /^\d+\.\d+\.?\s/.test(plain) ||
+    // Começa com preposição/artigo (continuação de parágrafo)
+    /^(e |de |do |da |dos |das |no |na |nos |nas |com |para |pelo |pela |pelos |pelas |ao |aos |às )/i.test(plain) ||
+    // Contém "por necessidade de serviço"
+    /por\s+necessidade\s+de\s+servi[çc]o/i.test(plain) ||
+    // Contém SEI (referência de processo)
+    /\(SEI[-\s]\d+/.test(plain) ||
+    // Linha de portaria/designação narrativa
+    /\bPortaria\b/i.test(plain) ||
+    /\bdesignando\b/i.test(plain) ||
+    /\bnomeando\b/i.test(plain) ||
+    // Linha narrativa longa terminando em ponto com múltiplas vírgulas (parágrafo)
+    (plain.length > 80 && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) ||
+    // Referência institucional em parágrafo
+    /\b(da|do|de)\s+(Diretoria|Comando|Assessoria|Corregedoria|Secretaria|Divisão|Seção)\b/i.test(plain)
+  );
+};
+
+/**
+ * Verifica se uma linha está geometricamente alinhada com um bloco de tabela.
+ */
+export const isGeometricallyAlignedWithTable = (
+  lineTokens: TextToken[],
+  neighboringTableTokens: TextToken[]
+): boolean => {
+  if (lineTokens.length === 0 || neighboringTableTokens.length === 0) return false;
+
+  // Coleta os X-ranges das colunas das linhas de tabela vizinhas
+  const tableXRanges = neighboringTableTokens.map(tok => ({ xLeft: tok.x, xRight: tok.x + tok.w }));
+
+  // Verifica se pelo menos 50% dos tokens da linha atual se sobrepõem com algum range de tabela
+  let alignedCount = 0;
+  for (const tok of lineTokens) {
+    const overlap = tableXRanges.some(r =>
+      tok.x < r.xRight + 20 && tok.x + tok.w > r.xLeft - 20
+    );
+    if (overlap) alignedCount++;
+  }
+  return alignedCount >= Math.ceil(lineTokens.length * 0.5);
+};
 
 /**
  * Detecta se a linha possui estrutura típica de tabela.
@@ -553,10 +743,13 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
       /\bPortaria\b/i.test(plain) ||
       /\bdesignando\b/i.test(plain) ||
       /\bnomeando\b/i.test(plain) ||
+      /\bpromover\b/i.test(plain) ||
+      /\bagregar\b/i.test(plain) ||
       // Linha narrativa longa com vírgulas e terminação em ponto (parágrafo típico)
       (plain.length > 80 && /,$/.test(plain.replace(/\s+$/, '')) === false && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) ||
-      // Contém "da Diretoria" / "do Comando" / "da Assessoria" (referência institucional em parágrafo)
-      /\b(da|do|de)\s+(Diretoria|Comando|Assessoria|Corregedoria|Secretaria|Divisão|Seção)\b/i.test(plain) ||
+      // Contém "da Diretoria" / "do Comando" / "da Assessoria" 
+      // mas APENAS se não tiver múltiplos espaços largos (que indicariam tabela)
+      (/\b(da|do|de)\s+(Diretoria|Comando|Assessoria|Corregedoria|Secretaria|Divisão|Seção)\b/i.test(plain) && (plain.match(/\s{3,}/g) || []).length < 2) ||
       // Linha de dados de militar: contém RG seguido de número
       /\bRG\s+\d/.test(plain) ||
       // Linha com vírgula antes de RG = dado de militar
@@ -564,12 +757,18 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
       // Linha de horário: começa com hora (08h, 08:15h, etc.)
       /^\d{1,2}[h:]\d*/.test(plain.trim()) ||
       // Linha com "Id Funcional" seguido de número = dado de militar
-      /Id\s*Funcional\s+\d/i.test(plain);
+      /Id\s*Funcional\s+\d/i.test(plain) ||
+      // Linha que termina em hífen (palavra quebrada) - apenas se for curta (indicativo de quebra)
+      /-$/.test(plain) && plain.length < 50;
 
     if (isDefinitelyParagraph) return false;
 
     // ── ANÁLISE GEOMÉTRICA (quando tokens disponíveis) ──────────────────────
     if (tokens && tokens.length > 1) {
+        // Usa a Assinatura de Layout para decidir se é uma estrutura rítmica (tabela)
+        const signature = detectLayoutSignature(tokens);
+        if (signature.isRhythmic && signature.verticalAxes.length >= 3) return true;
+
         const sorted = [...tokens].sort((a, b) => a.x - b.x);
         const gaps: number[] = [];
         
@@ -586,7 +785,8 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
 
         // Tabela real: gaps de coluna são CONSISTENTES — vários gaps grandes do mesmo tamanho.
         // Parágrafo com negrito: 1-2 gaps grandes isolados, resto pequeno.
-        const largeGapThreshold = Math.max(60, medianGap * 4);
+        const settings = calibrationService.settings;
+        const largeGapThreshold = Math.max(settings.tableGapThreshold, medianGap * 4);
         const largeGaps = gaps.filter(g => g > largeGapThreshold);
 
         // Exige pelo menos 2 gaps grandes para confirmar estrutura de coluna
@@ -595,7 +795,7 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
 
         // 1 gap grande só confirma tabela se for muito grande (> 150px = coluna bem separada)
         // E a linha for muito curta (não é parágrafo com negrito no meio)
-        if (largeGaps.length === 1 && maxGap > 150 && plain.length < 60) return true;
+        if (largeGaps.length === 1 && maxGap > settings.tableStrictGapThreshold && plain.length < 60) return true;
 
         // Gap máximo pequeno = parágrafo justificado
         if (maxGap < 40) return false;
