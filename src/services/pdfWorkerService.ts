@@ -147,34 +147,19 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
           const fontFamily = (style.fontFamily || "").toLowerCase();
           
           // Detecção pelo nome real da fonte via textContent.styles (pdfjs 4.x/5.x)
-          // fontFamily ex: "SegoeUI-Bold, sans-serif" ou "BookmanOldStyle-Bold, serif"
           const isBoldByFamily = fontFamily.includes('bold') || fontFamily.includes('black') || fontFamily.includes('heavy');
           const isItalicByFamily = fontFamily.includes('italic') || fontFamily.includes('oblique');
 
-          // Fallback 1: o ID interno do pdfjs (ex: "BCDHEE+SegoeUI-Bold") contém o nome real após "+"
+          // Fallback 1: o ID interno do pdfjs (ex: "BCDHEE+SegoeUI-Bold")
           const internalId = (item.fontName || "").toLowerCase();
           const fontNameAfterPlus = internalId.includes('+') ? internalId.split('+')[1] : internalId;
           const isBoldByName = fontNameAfterPlus.includes('bold') || fontNameAfterPlus.includes('black') || fontNameAfterPlus.includes('heavy') || internalId.includes(',bold');
           const isItalicByName = fontNameAfterPlus.includes('italic') || fontNameAfterPlus.includes('oblique');
 
-          // Fallback 2: commonObjs (mais confiável quando styles não tem nome real)
+          // Fallback 2: commonObjs
           const fromCommon = fontMap.get(item.fontName);
           const isBoldByCommon = fromCommon?.isBold ?? false;
           const isItalicByCommon = fromCommon?.isItalic ?? false;
-
-          const isBold = isBoldByFamily || isBoldByName || isBoldByCommon;
-          const isItalic = isItalicByFamily || isItalicByName || isItalicByCommon;
-
-          // Diagnóstico: loga fontes únicas na primeira página para validação
-          if (i === 1 && item.str.trim().length > 0) {
-            const key = `${item.fontName}|${fontFamily}`;
-            if (!(extractTextFromPdf as any)._loggedFonts) (extractTextFromPdf as any)._loggedFonts = new Set();
-            if (!(extractTextFromPdf as any)._loggedFonts.has(key)) {
-              (extractTextFromPdf as any)._loggedFonts.add(key);
-              const commonName = fromCommon ? `common="${fontMap.get(item.fontName)}"` : 'common=null';
-              console.log(`[Sentinela][Font] id="${item.fontName}" family="${fontFamily}" ${commonName} isBold=${isBold} isItalic=${isItalic} sample="${item.str.substring(0,20)}"`);
-            }
-          }
 
           return {
             text: item.str,
@@ -183,12 +168,59 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
             w: item.width,
             h: item.height,
             page: i,
-            isBold,
-            isItalic,
+            isBold: isBoldByFamily || isBoldByName || isBoldByCommon,
+            isItalic: isItalicByFamily || isItalicByName || isItalicByCommon,
             fontSize: transform[0],
+            fontName: item.fontName, // Preserva para análise estatística
           };
         })
         .filter((t: any) => t.text.trim().length > 0);
+
+      // Fallback 3: Análise estatística de peso visual (quando todos os métodos acima falharam)
+      // Calcula a densidade média (width/fontSize) por fonte e classifica as mais densas como bold
+      const fontDensities = new Map<string, { sum: number; count: number }>();
+      tokens.forEach((t: any) => {
+        if (!t.isBold && t.text.trim().length > 0 && t.fontSize > 0) {
+          const density = t.w / (t.text.length * t.fontSize);
+          if (!fontDensities.has(t.fontName)) fontDensities.set(t.fontName, { sum: 0, count: 0 });
+          const stats = fontDensities.get(t.fontName)!;
+          stats.sum += density;
+          stats.count++;
+        }
+      });
+
+      if (fontDensities.size >= 2) {
+        const avgDensities = Array.from(fontDensities.entries()).map(([fontName, stats]) => ({
+          fontName,
+          avgDensity: stats.sum / stats.count,
+        }));
+        avgDensities.sort((a, b) => a.avgDensity - b.avgDensity);
+        
+        // Threshold: se a densidade de uma fonte é > 1.15x a densidade da fonte mais leve, é bold
+        const lightestDensity = avgDensities[0].avgDensity;
+        const boldThreshold = lightestDensity * 1.15;
+        const boldFonts = new Set(avgDensities.filter(f => f.avgDensity > boldThreshold).map(f => f.fontName));
+
+        if (boldFonts.size > 0) {
+          tokens.forEach((t: any) => {
+            if (!t.isBold && boldFonts.has(t.fontName)) t.isBold = true;
+          });
+          console.log(`[Sentinela] Detecção de bold via análise estatística: ${boldFonts.size} fontes classificadas como bold (threshold=${boldThreshold.toFixed(3)})`);
+        }
+      }
+
+      // Log diagnóstico após análise estatística
+      if (i === 1) {
+        const uniqueFonts = new Set(tokens.map(t => t.fontName));
+        uniqueFonts.forEach(fontName => {
+          const sample = tokens.find(t => t.fontName === fontName);
+          if (sample) {
+            const fromCommon = fontMap.get(fontName);
+            const commonName = fromCommon ? `common="${JSON.stringify(fromCommon)}"` : 'common=null';
+            console.log(`[Sentinela][Font] id="${fontName}" family="${(textContent.styles as any)[fontName]?.fontFamily || 'sans-serif'}" ${commonName} isBold=${sample.isBold} isItalic=${sample.isItalic} sample="${sample.text.substring(0,20)}"`);
+          }
+        });
+      }
     }
 
     // Agrupamento por Linhas Visuais (Y-tolerance de 4px para maior precisão)
