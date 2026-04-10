@@ -189,17 +189,34 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
         }
       });
 
+      // Só aplica análise estatística se houver pelo menos 2 fontes distintas
       if (fontDensities.size >= 2) {
         const avgDensities = Array.from(fontDensities.entries()).map(([fontName, stats]) => ({
           fontName,
           avgDensity: stats.sum / stats.count,
+          count: stats.count,
         }));
         avgDensities.sort((a, b) => a.avgDensity - b.avgDensity);
         
-        // Threshold: se a densidade de uma fonte é > 1.15x a densidade da fonte mais leve, é bold
+        // Threshold conservador: densidade > 1.25x a fonte mais leve E pelo menos 10 amostras
         const lightestDensity = avgDensities[0].avgDensity;
-        const boldThreshold = lightestDensity * 1.15;
-        const boldFonts = new Set(avgDensities.filter(f => f.avgDensity > boldThreshold).map(f => f.fontName));
+        const boldThreshold = lightestDensity * 1.25;
+        const boldFonts = new Set(
+          avgDensities
+            .filter(f => f.avgDensity > boldThreshold && f.count >= 10)
+            .map(f => f.fontName)
+        );
+
+        // Limita a no máximo 2 fontes bold por página (evita falsos positivos)
+        if (boldFonts.size > 2) {
+          const topTwo = avgDensities
+            .filter(f => boldFonts.has(f.fontName))
+            .sort((a, b) => b.avgDensity - a.avgDensity)
+            .slice(0, 2)
+            .map(f => f.fontName);
+          boldFonts.clear();
+          topTwo.forEach(f => boldFonts.add(f));
+        }
 
         if (boldFonts.size > 0) {
           tokens.forEach((t: any) => {
