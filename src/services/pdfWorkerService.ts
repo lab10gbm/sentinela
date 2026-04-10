@@ -176,53 +176,59 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
         })
         .filter((t: any) => t.text.trim().length > 0);
 
-      // Fallback 3: Análise estatística de peso visual (quando todos os métodos acima falharam)
-      // Calcula a densidade média (width/fontSize) por fonte e classifica as mais densas como bold
-      const fontDensities = new Map<string, { sum: number; count: number }>();
+      // Fallback 3: Análise híbrida (frequência + densidade)
+      // Fontes bold aparecem menos vezes (títulos) e têm maior densidade (traços grossos)
+      const fontStats = new Map<string, { count: number; densitySum: number; densityCount: number }>();
       tokens.forEach((t: any) => {
         if (!t.isBold && t.text.trim().length > 0 && t.fontSize > 0) {
-          const density = t.w / (t.text.length * t.fontSize);
-          if (!fontDensities.has(t.fontName)) fontDensities.set(t.fontName, { sum: 0, count: 0 });
-          const stats = fontDensities.get(t.fontName)!;
-          stats.sum += density;
+          if (!fontStats.has(t.fontName)) {
+            fontStats.set(t.fontName, { count: 0, densitySum: 0, densityCount: 0 });
+          }
+          const stats = fontStats.get(t.fontName)!;
           stats.count++;
+          const density = t.w / (t.text.length * t.fontSize);
+          stats.densitySum += density;
+          stats.densityCount++;
         }
       });
 
-      // Só aplica análise estatística se houver pelo menos 2 fontes distintas
-      if (fontDensities.size >= 2) {
-        const avgDensities = Array.from(fontDensities.entries()).map(([fontName, stats]) => ({
+      if (fontStats.size >= 2) {
+        const totalTokens = Array.from(fontStats.values()).reduce((sum, s) => sum + s.count, 0);
+        
+        const fontAnalysis = Array.from(fontStats.entries()).map(([fontName, stats]) => ({
           fontName,
-          avgDensity: stats.sum / stats.count,
+          frequency: stats.count / totalTokens,
+          avgDensity: stats.densitySum / stats.densityCount,
           count: stats.count,
         }));
-        avgDensities.sort((a, b) => a.avgDensity - b.avgDensity);
-        
-        // Threshold conservador: densidade > 1.25x a fonte mais leve E pelo menos 10 amostras
-        const lightestDensity = avgDensities[0].avgDensity;
-        const boldThreshold = lightestDensity * 1.25;
+
+        // Ordena por densidade (maior = mais provável de ser bold)
+        fontAnalysis.sort((a, b) => b.avgDensity - a.avgDensity);
+
+        // Critério híbrido: fonte é bold se:
+        // 1. Frequência < 40% (aparece menos que o corpo de texto) E
+        // 2. Densidade > 1.2x a fonte mais leve E
+        // 3. Pelo menos 10 amostras
+        const lightestDensity = fontAnalysis[fontAnalysis.length - 1].avgDensity;
+        const densityThreshold = lightestDensity * 1.2;
+        const frequencyThreshold = calibrationService.settings.boldContrastThreshold; // 0.4 padrão
+
         const boldFonts = new Set(
-          avgDensities
-            .filter(f => f.avgDensity > boldThreshold && f.count >= 10)
+          fontAnalysis
+            .filter(f => 
+              f.frequency < frequencyThreshold && 
+              f.avgDensity > densityThreshold && 
+              f.count >= 10
+            )
+            .slice(0, 2) // Máximo 2 fontes bold
             .map(f => f.fontName)
         );
-
-        // Limita a no máximo 2 fontes bold por página (evita falsos positivos)
-        if (boldFonts.size > 2) {
-          const topTwo = avgDensities
-            .filter(f => boldFonts.has(f.fontName))
-            .sort((a, b) => b.avgDensity - a.avgDensity)
-            .slice(0, 2)
-            .map(f => f.fontName);
-          boldFonts.clear();
-          topTwo.forEach(f => boldFonts.add(f));
-        }
 
         if (boldFonts.size > 0) {
           tokens.forEach((t: any) => {
             if (!t.isBold && boldFonts.has(t.fontName)) t.isBold = true;
           });
-          console.log(`[Sentinela] Detecção de bold via análise estatística: ${boldFonts.size} fontes classificadas como bold (threshold=${boldThreshold.toFixed(3)})`);
+          console.log(`[Sentinela] Detecção de bold via análise híbrida: ${boldFonts.size} fontes (freq<${frequencyThreshold}, density>${densityThreshold.toFixed(3)})`);
         }
       }
 
