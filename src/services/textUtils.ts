@@ -389,8 +389,16 @@ export const joinWrappedParagraphs = (text: string): string => {
     const current = lines[i].trim();
     const next = (i + 1 < lines.length) ? lines[i + 1].trim() : null;
 
+    // Linha vazia: só preserva se a linha anterior termina com pontuação forte
+    // ou é um header — caso contrário, une com a próxima (era quebra de linha do PDF)
     if (!current) {
-      result.push("");
+      const prev = result.length > 0 ? result[result.length - 1] : "";
+      const prevEndsStrong = /[.:;!?]$/.test(prev);
+      const prevIsHeader = prev ? isVisualHeader(prev) : false;
+      if (prevEndsStrong || prevIsHeader || !prev) {
+        result.push("");
+      }
+      // Se não, descarta a linha vazia (era artefato de quebra de linha do PDF)
       continue;
     }
 
