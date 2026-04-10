@@ -126,9 +126,31 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
           const style = (textContent.styles as any)[item.fontName] || {};
           const fontFamily = (style.fontFamily || "").toLowerCase();
           
-          // Detecção Industrial baseada no nome real da fonte mapeado pelo PDF.js
-          const isBold = fontFamily.includes('bold') || fontFamily.includes('black') || fontFamily.includes('heavy');
-          const isItalic = fontFamily.includes('italic') || fontFamily.includes('oblique');
+          // Detecção pelo nome real da fonte via textContent.styles (pdfjs 4.x/5.x)
+          // fontFamily ex: "SegoeUI-Bold, sans-serif" ou "BookmanOldStyle-Bold, serif"
+          const isBoldByFamily = fontFamily.includes('bold') || fontFamily.includes('black') || fontFamily.includes('heavy');
+          const isItalicByFamily = fontFamily.includes('italic') || fontFamily.includes('oblique');
+
+          // Fallback: o ID interno do pdfjs (ex: "BCDHEE+SegoeUI-Bold") contém o nome real após "+"
+          // Cobre casos onde fontFamily não está populado
+          const internalId = (item.fontName || "").toLowerCase();
+          const fontNameAfterPlus = internalId.includes('+') ? internalId.split('+')[1] : internalId;
+          // Também cobre "Segoe UI,Bold" (vírgula em vez de hífen — boletins 039 e 051)
+          const isBoldByName = fontNameAfterPlus.includes('bold') || fontNameAfterPlus.includes('black') || fontNameAfterPlus.includes('heavy') || internalId.includes(',bold');
+          const isItalicByName = fontNameAfterPlus.includes('italic') || fontNameAfterPlus.includes('oblique');
+
+          const isBold = isBoldByFamily || isBoldByName;
+          const isItalic = isItalicByFamily || isItalicByName;
+
+          // Diagnóstico: loga fontes únicas na primeira página para validação
+          if (i === 1 && item.str.trim().length > 0) {
+            const key = `${item.fontName}|${fontFamily}`;
+            if (!(extractTextFromPdf as any)._loggedFonts) (extractTextFromPdf as any)._loggedFonts = new Set();
+            if (!(extractTextFromPdf as any)._loggedFonts.has(key)) {
+              (extractTextFromPdf as any)._loggedFonts.add(key);
+              console.log(`[Sentinela][Font] id="${item.fontName}" family="${fontFamily}" isBold=${isBold} isItalic=${isItalic} sample="${item.str.substring(0,20)}"`);
+            }
+          }
 
           return {
             text: item.str,
