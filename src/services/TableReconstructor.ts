@@ -4,30 +4,103 @@ import { isTableHeader, normalizeCellText } from "./textUtils";
 /**
  * TableReconstructor v5
  * 
- * Hybrid Approach:
- *  - For simple data tables: Template-based (current logic)
- *  - For complex forms: Border-based detection (new)
- * 
- * Detects table type and routes to appropriate algorithm.
+ * Three-tier approach:
+ *  1. Simple data tables → Template-based (header detection)
+ *  2. Complex forms → Layout preservation (hierarchical text)
+ *  3. Fallback → Border-based (X-gap analysis)
  */
 export const reconstructTable = (tokens: TextToken[]): TableData => {
   if (tokens.length === 0) {
     return { rows: [], columnCount: 0, rowCount: 0 };
   }
 
-  // Quick heuristic: if tokens are very sparse (< 3 per line on average),
-  // it's likely a form with borders, not a data table
+  // Heuristic 1: Very sparse tokens (< 2 per line) = complex form
   const avgTokensPerLine = tokens.length / new Set(tokens.map(t => Math.round(t.y / 6))).size;
-  const isLikelyForm = avgTokensPerLine < 3;
+  
+  // Heuristic 2: High Y-variance = multi-line cells (forms)
+  const yValues = tokens.map(t => t.y);
+  const yMin = Math.min(...yValues);
+  const yMax = Math.max(...yValues);
+  const yRange = yMax - yMin;
+  const avgYGap = yRange / new Set(tokens.map(t => Math.round(t.y / 6))).size;
+  
+  const isComplexForm = avgTokensPerLine < 2 || avgYGap > 20;
 
-  if (isLikelyForm) {
-    // Try border-based reconstruction (for forms)
+  if (isComplexForm) {
+    // Use layout preservation (renders as formatted text, not grid)
+    return reconstructTableAsLayout(tokens);
+  }
+
+  // Medium complexity: try border-based
+  if (avgTokensPerLine < 4) {
     const borderResult = reconstructTableByBorders(tokens);
     if (borderResult.rowCount > 0) return borderResult;
   }
 
-  // Fallback to template-based (for data tables)
+  // Simple data table: template-based
   return reconstructTableByTemplate(tokens);
+};
+
+/**
+ * Layout preservation (for complex forms that don't fit grid structure)
+ * Renders as hierarchical text blocks instead of trying to force into grid
+ */
+const reconstructTableAsLayout = (tokens: TextToken[]): TableData => {
+  // Group by Y with larger epsilon to capture multi-line cells
+  const Y_EPSILON = 12;
+  const rowGroups = new Map<number, TextToken[]>();
+  
+  for (const tok of tokens) {
+    const yKey = Math.round(tok.y / Y_EPSILON) * Y_EPSILON;
+    if (!rowGroups.has(yKey)) rowGroups.set(yKey, []);
+    rowGroups.get(yKey)!.push(tok);
+  }
+
+  const sortedYKeys = Array.from(rowGroups.keys()).sort((a, b) => b - a);
+  
+  // Create single-column table with each row as a formatted text block
+  const finalRows: TableCell[][] = [];
+
+  for (const yKey of sortedYKeys) {
+    const rowTokens = rowGroups.get(yKey)!.sort((a, b) => a.x - b.x);
+    
+    // Build text with preserved spacing
+    let text = "";
+    let lastXEnd = -1;
+    
+    for (const tok of rowTokens) {
+      let tokText = tok.isBold ? `**${tok.text}**` : tok.text;
+      if (tok.isUnderlined) tokText = `<u>${tokText}</u>`;
+      
+      if (lastXEnd >= 0) {
+        const gap = tok.x - lastXEnd;
+        if (gap > 40) text += "    "; // Large gap = tab
+        else if (gap > 10) text += "  "; // Medium gap = double space
+        else if (gap > 2) text += " "; // Small gap = single space
+      }
+      
+      text += tokText;
+      lastXEnd = tok.x + tok.w;
+    }
+
+    if (text.trim()) {
+      finalRows.push([{
+        text: normalizeCellText(text),
+        tokens: rowTokens,
+        row: finalRows.length,
+        col: 0,
+        rowSpan: 1,
+        colSpan: 1,
+        align: 'left',
+      }]);
+    }
+  }
+
+  return {
+    rows: finalRows,
+    columnCount: 1,
+    rowCount: finalRows.length,
+  };
 };
 
 /**
