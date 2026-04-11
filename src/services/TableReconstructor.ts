@@ -2,14 +2,110 @@ import { TextToken, TableData, TableCell } from "../types";
 import { isTableHeader, normalizeCellText } from "./textUtils";
 
 /**
- * TableReconstructor v4
+ * TableReconstructor v5
  * 
- * Template-Based Structural Extraction:
- *  1. Identifies the "First Line" (Header) that defines the table structure.
- *  2. Uses X-coordinates of header cells as fixed column boundaries.
- *  3. Maps all subsequent phrases to these boundaries, preventing cell merging.
+ * Hybrid Approach:
+ *  - For simple data tables: Template-based (current logic)
+ *  - For complex forms: Border-based detection (new)
+ * 
+ * Detects table type and routes to appropriate algorithm.
  */
 export const reconstructTable = (tokens: TextToken[]): TableData => {
+  if (tokens.length === 0) {
+    return { rows: [], columnCount: 0, rowCount: 0 };
+  }
+
+  // Quick heuristic: if tokens are very sparse (< 3 per line on average),
+  // it's likely a form with borders, not a data table
+  const avgTokensPerLine = tokens.length / new Set(tokens.map(t => Math.round(t.y / 6))).size;
+  const isLikelyForm = avgTokensPerLine < 3;
+
+  if (isLikelyForm) {
+    // Try border-based reconstruction (for forms)
+    const borderResult = reconstructTableByBorders(tokens);
+    if (borderResult.rowCount > 0) return borderResult;
+  }
+
+  // Fallback to template-based (for data tables)
+  return reconstructTableByTemplate(tokens);
+};
+
+/**
+ * Border-based reconstruction (for complex forms with visual borders)
+ * Uses Y-gaps and sparse token distribution to infer cell boundaries
+ */
+const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
+  // Group tokens by Y (rows)
+  const Y_EPSILON = 8;
+  const rowGroups = new Map<number, TextToken[]>();
+  
+  for (const tok of tokens) {
+    const yKey = Math.round(tok.y / Y_EPSILON) * Y_EPSILON;
+    if (!rowGroups.has(yKey)) rowGroups.set(yKey, []);
+    rowGroups.get(yKey)!.push(tok);
+  }
+
+  const sortedYKeys = Array.from(rowGroups.keys()).sort((a, b) => b - a);
+  
+  // Detect column boundaries by analyzing X-distribution across all rows
+  const allX = tokens.map(t => t.x).sort((a, b) => a - b);
+  const xGaps: number[] = [];
+  for (let i = 1; i < allX.length; i++) {
+    const gap = allX[i] - allX[i-1];
+    if (gap > 50) xGaps.push(allX[i]); // Large gap = column boundary
+  }
+
+  // Define columns: [0, gap1, gap2, ..., maxX]
+  const columnBoundaries = [0, ...xGaps, Math.max(...tokens.map(t => t.x + t.w))];
+  const columnCount = columnBoundaries.length - 1;
+
+  if (columnCount < 2) return { rows: [], columnCount: 0, rowCount: 0 };
+
+  const finalRows: TableCell[][] = [];
+
+  for (const yKey of sortedYKeys) {
+    const rowTokens = rowGroups.get(yKey)!.sort((a, b) => a.x - b.x);
+    const rowCells: TableCell[] = [];
+
+    for (let c = 0; c < columnCount; c++) {
+      const xStart = columnBoundaries[c];
+      const xEnd = columnBoundaries[c + 1];
+      
+      // Find tokens in this cell
+      const cellTokens = rowTokens.filter(t => t.x >= xStart && t.x < xEnd);
+      
+      let text = "";
+      for (const tok of cellTokens) {
+        let tokText = tok.isBold ? `**${tok.text}**` : tok.text;
+        if (tok.isUnderlined) tokText = `<u>${tokText}</u>`;
+        text += (text ? " " : "") + tokText;
+      }
+
+      rowCells.push({
+        text: normalizeCellText(text),
+        tokens: cellTokens,
+        row: finalRows.length,
+        col: c,
+        rowSpan: 1,
+        colSpan: 1,
+        align: 'left',
+      });
+    }
+
+    finalRows.push(rowCells);
+  }
+
+  return {
+    rows: finalRows,
+    columnCount,
+    rowCount: finalRows.length,
+  };
+};
+
+/**
+ * Template-based reconstruction (original algorithm for data tables)
+ */
+const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
   if (tokens.length === 0) {
     return { rows: [], columnCount: 0, rowCount: 0 };
   }
