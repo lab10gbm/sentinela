@@ -17,18 +17,24 @@ export const reconstructTable = (tokens: TextToken[]): TableData => {
   const uniqueYLines = new Set(tokens.map(t => Math.round(t.y / 6))).size;
   const avgTokensPerLine = tokens.length / uniqueYLines;
   
+  console.log(`[TableReconstructor] tokens=${tokens.length}, lines=${uniqueYLines}, avg=${avgTokensPerLine.toFixed(2)}`);
+  
   // Heuristic 1: Dense tables (> 5 tokens/line) = data table, use template
   if (avgTokensPerLine > 5) {
+    console.log(`[TableReconstructor] Using TEMPLATE (dense table)`);
     return reconstructTableByTemplate(tokens);
   }
 
   // Heuristic 2: Sparse tables (1-5 tokens/line) = form with borders, use histogram
   if (avgTokensPerLine >= 1) {
+    console.log(`[TableReconstructor] Using BORDER-BASED (sparse form)`);
     const borderResult = reconstructTableByBorders(tokens);
+    console.log(`[TableReconstructor] Border-based result: ${borderResult.columnCount} cols, ${borderResult.rowCount} rows`);
     if (borderResult.columnCount >= 2) return borderResult;
   }
 
   // Heuristic 3: Very sparse (< 1 token/line) = complex nested form, preserve layout
+  console.log(`[TableReconstructor] Using LAYOUT PRESERVATION (very sparse)`);
   return reconstructTableAsLayout(tokens);
 };
 
@@ -156,6 +162,8 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
   
   columnBoundaries.push(Math.max(...tokens.map(t => t.x + t.w)) + 5);
   const columnCount = columnBoundaries.length - 1;
+
+  console.log(`[Border-based] Detected ${columnCount} columns at X: [${columnBoundaries.map(x => Math.round(x)).join(', ')}]`);
 
   if (columnCount < 2) return { rows: [], columnCount: 0, rowCount: 0 };
 
