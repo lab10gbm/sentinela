@@ -199,32 +199,44 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
   }
 
   // Step 4: Detect and merge cells with colspan/rowspan
-  // Colspan: consecutive empty cells in a row with text in first cell
+  
+  // 4a. Colspan: cells that span multiple columns
   for (let r = 0; r < finalRows.length; r++) {
     for (let c = 0; c < columnCount; c++) {
       const cell = finalRows[r][c];
       if (cell.text.trim().length > 0 && cell.colSpan === 1) {
         let span = 1;
+        // Count consecutive empty cells to the right
         while (c + span < columnCount && finalRows[r][c + span].text.trim().length === 0) {
           span++;
         }
+        // Also check if cell text is very long (likely spans multiple columns)
+        const cellWidth = cell.tokens.reduce((sum, t) => sum + t.w, 0);
+        const avgColWidth = (columnBoundaries[columnCount] - columnBoundaries[0]) / columnCount;
+        if (cellWidth > avgColWidth * 1.5) {
+          // Text is wider than average column — likely spans multiple columns
+          span = Math.max(span, Math.ceil(cellWidth / avgColWidth));
+        }
         if (span > 1) {
-          cell.colSpan = span;
+          cell.colSpan = Math.min(span, columnCount - c);
           // Mark spanned cells as merged
-          for (let s = 1; s < span; s++) {
-            finalRows[r][c + s].text = ""; // Clear to avoid duplication
+          for (let s = 1; s < cell.colSpan; s++) {
+            if (c + s < columnCount) {
+              finalRows[r][c + s].text = "";
+            }
           }
         }
       }
     }
   }
 
-  // Rowspan: consecutive rows with same text in same column
+  // 4b. Rowspan: cells that span multiple rows
   for (let c = 0; c < columnCount; c++) {
     for (let r = 0; r < finalRows.length; r++) {
       const cell = finalRows[r][c];
       if (cell.text.trim().length > 0 && cell.rowSpan === 1) {
         let span = 1;
+        // Count consecutive empty cells below
         while (r + span < finalRows.length && 
                finalRows[r + span][c].text.trim().length === 0 &&
                finalRows[r + span][c].tokens.length === 0) {
@@ -232,6 +244,30 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
         }
         if (span > 1) {
           cell.rowSpan = span;
+        }
+      }
+    }
+  }
+
+  // 4c. Merge multi-line cells (consecutive rows with text in same column)
+  for (let c = 0; c < columnCount; c++) {
+    for (let r = 0; r < finalRows.length - 1; r++) {
+      const cell = finalRows[r][c];
+      const nextCell = finalRows[r + 1][c];
+      
+      // If current cell has text and next cell also has text in same column,
+      // and they're close together (< 15px Y-gap), merge them
+      if (cell.text.trim().length > 0 && nextCell.text.trim().length > 0) {
+        const cellY = cell.tokens.length > 0 ? cell.tokens[0].y : 0;
+        const nextY = nextCell.tokens.length > 0 ? nextCell.tokens[0].y : 0;
+        const yGap = Math.abs(cellY - nextY);
+        
+        if (yGap < 15) {
+          // Merge next cell into current cell
+          cell.text = (cell.text + " " + nextCell.text).trim();
+          cell.tokens.push(...nextCell.tokens);
+          nextCell.text = "";
+          nextCell.tokens = [];
         }
       }
     }
