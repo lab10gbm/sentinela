@@ -323,36 +323,28 @@ const cleanAndFormatSlice = (
   const flushTable = () => {
     if (tableLines.length === 0) return;
     
-    // Separa títulos/cabeçalhos que não fazem parte da tabela
-    const titleLines: typeof tableLines = [];
-    const actualTableLines: typeof tableLines = [];
+    // Separa apenas o título principal (primeira linha em CAIXA ALTA sem gaps)
+    let titleLine: typeof tableLines[0] | null = null;
+    let startIdx = 0;
     
-    for (const line of tableLines) {
-      if (line.isBridge) {
-        actualTableLines.push(line);
-        continue;
-      }
-      
-      const plain = line.text.replace(/\*\*/g, '').trim();
+    if (tableLines.length > 0 && !tableLines[0].isBridge) {
+      const firstLine = tableLines[0];
+      const plain = firstLine.text.replace(/\*\*/g, '').trim();
       const isAllCaps = plain === plain.toUpperCase() && plain.length > 15;
       const hasNoWideGaps = (plain.match(/\s{3,}/g) || []).length === 0;
-      const isTitle = isAllCaps && hasNoWideGaps;
       
-      // Também detecta cabeçalhos descritivos (ex: "CONCEITO: Os alunos...")
-      const isDescriptiveHeader = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{3,}:/.test(plain) && plain.length > 40;
-      
-      if ((isTitle || isDescriptiveHeader) && actualTableLines.length === 0) {
-        // Título/cabeçalho antes da tabela começar
-        titleLines.push(line);
-      } else {
-        actualTableLines.push(line);
+      if (isAllCaps && hasNoWideGaps) {
+        titleLine = firstLine;
+        startIdx = 1;
       }
     }
     
-    // Flush títulos como parágrafos
-    if (titleLines.length > 0) {
+    const actualTableLines = tableLines.slice(startIdx);
+    
+    // Flush título como parágrafo
+    if (titleLine) {
       flushParagraph();
-      titleLines.forEach(l => paragraphLines.push(l.text));
+      paragraphLines.push(titleLine.text);
       flushParagraph();
     }
     
