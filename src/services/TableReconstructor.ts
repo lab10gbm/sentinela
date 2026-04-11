@@ -6,39 +6,30 @@ import { isTableHeader, normalizeCellText } from "./textUtils";
  * 
  * Three-tier approach:
  *  1. Simple data tables → Template-based (header detection)
- *  2. Complex forms → Layout preservation (hierarchical text)
- *  3. Fallback → Border-based (X-gap analysis)
+ *  2. Sparse forms → Border-based (histogram analysis)
+ *  3. Very complex → Layout preservation (last resort)
  */
 export const reconstructTable = (tokens: TextToken[]): TableData => {
   if (tokens.length === 0) {
     return { rows: [], columnCount: 0, rowCount: 0 };
   }
 
-  // Heuristic 1: Very sparse tokens (< 2 per line) = complex form
-  const avgTokensPerLine = tokens.length / new Set(tokens.map(t => Math.round(t.y / 6))).size;
+  const uniqueYLines = new Set(tokens.map(t => Math.round(t.y / 6))).size;
+  const avgTokensPerLine = tokens.length / uniqueYLines;
   
-  // Heuristic 2: High Y-variance = multi-line cells (forms)
-  const yValues = tokens.map(t => t.y);
-  const yMin = Math.min(...yValues);
-  const yMax = Math.max(...yValues);
-  const yRange = yMax - yMin;
-  const avgYGap = yRange / new Set(tokens.map(t => Math.round(t.y / 6))).size;
-  
-  const isComplexForm = avgTokensPerLine < 2 || avgYGap > 20;
-
-  if (isComplexForm) {
-    // Use layout preservation (renders as formatted text, not grid)
-    return reconstructTableAsLayout(tokens);
+  // Heuristic 1: Dense tables (> 5 tokens/line) = data table, use template
+  if (avgTokensPerLine > 5) {
+    return reconstructTableByTemplate(tokens);
   }
 
-  // Medium complexity: try border-based
-  if (avgTokensPerLine < 4) {
+  // Heuristic 2: Sparse tables (1-5 tokens/line) = form with borders, use histogram
+  if (avgTokensPerLine >= 1) {
     const borderResult = reconstructTableByBorders(tokens);
-    if (borderResult.rowCount > 0) return borderResult;
+    if (borderResult.columnCount >= 2) return borderResult;
   }
 
-  // Simple data table: template-based
-  return reconstructTableByTemplate(tokens);
+  // Heuristic 3: Very sparse (< 1 token/line) = complex nested form, preserve layout
+  return reconstructTableAsLayout(tokens);
 };
 
 /**
@@ -122,7 +113,7 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
   
   // Step 2: Detect column boundaries via histogram analysis
   // Build X-histogram: count tokens in each X-bucket
-  const X_BUCKET_SIZE = 5;
+  const X_BUCKET_SIZE = 3; // Smaller bucket for finer resolution
   const xHistogram = new Map<number, number>();
   
   for (const tok of tokens) {
@@ -132,24 +123,38 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
 
   // Find valleys (low-density regions) = column boundaries
   const sortedXBuckets = Array.from(xHistogram.keys()).sort((a, b) => a - b);
-  const columnBoundaries: number[] = [0];
+  const columnBoundaries: number[] = [Math.min(...tokens.map(t => t.x)) - 5];
   
-  for (let i = 1; i < sortedXBuckets.length - 1; i++) {
-    const prev = xHistogram.get(sortedXBuckets[i - 1]) || 0;
+  // Detect valleys: regions with 0 tokens surrounded by regions with tokens
+  let inValley = false;
+  let valleyStart = -1;
+  
+  for (let i = 0; i < sortedXBuckets.length; i++) {
     const curr = xHistogram.get(sortedXBuckets[i]) || 0;
-    const next = xHistogram.get(sortedXBuckets[i + 1]) || 0;
     
-    // Valley: current bucket has significantly fewer tokens than neighbors
-    if (curr === 0 && (prev > 0 || next > 0)) {
-      const xBoundary = sortedXBuckets[i];
-      // Avoid duplicate boundaries too close together
-      if (columnBoundaries.length === 0 || xBoundary - columnBoundaries[columnBoundaries.length - 1] > 30) {
-        columnBoundaries.push(xBoundary);
+    if (curr === 0 && !inValley) {
+      // Start of valley
+      inValley = true;
+      valleyStart = sortedXBuckets[i];
+    } else if (curr > 0 && inValley) {
+      // End of valley - use middle of valley as boundary
+      const valleyEnd = sortedXBuckets[i];
+      const valleyWidth = valleyEnd - valleyStart;
+      
+      // Only consider valleys wider than 15px (real column gaps)
+      if (valleyWidth > 15) {
+        const xBoundary = valleyStart + valleyWidth / 2;
+        // Avoid duplicate boundaries too close together
+        const lastBoundary = columnBoundaries[columnBoundaries.length - 1];
+        if (xBoundary - lastBoundary > 25) {
+          columnBoundaries.push(xBoundary);
+        }
       }
+      inValley = false;
     }
   }
   
-  columnBoundaries.push(Math.max(...tokens.map(t => t.x + t.w)) + 10);
+  columnBoundaries.push(Math.max(...tokens.map(t => t.x + t.w)) + 5);
   const columnCount = columnBoundaries.length - 1;
 
   if (columnCount < 2) return { rows: [], columnCount: 0, rowCount: 0 };
