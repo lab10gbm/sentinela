@@ -105,10 +105,10 @@ const reconstructTableAsLayout = (tokens: TextToken[]): TableData => {
 
 /**
  * Border-based reconstruction (for complex forms with visual borders)
- * Uses Y-gaps and sparse token distribution to infer cell boundaries
+ * Uses clustering analysis to detect cell boundaries from token distribution
  */
 const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
-  // Group tokens by Y (rows)
+  // Step 1: Cluster tokens by Y (rows) with adaptive epsilon
   const Y_EPSILON = 8;
   const rowGroups = new Map<number, TextToken[]>();
   
@@ -120,20 +120,41 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
 
   const sortedYKeys = Array.from(rowGroups.keys()).sort((a, b) => b - a);
   
-  // Detect column boundaries by analyzing X-distribution across all rows
-  const allX = tokens.map(t => t.x).sort((a, b) => a - b);
-  const xGaps: number[] = [];
-  for (let i = 1; i < allX.length; i++) {
-    const gap = allX[i] - allX[i-1];
-    if (gap > 50) xGaps.push(allX[i]); // Large gap = column boundary
+  // Step 2: Detect column boundaries via histogram analysis
+  // Build X-histogram: count tokens in each X-bucket
+  const X_BUCKET_SIZE = 5;
+  const xHistogram = new Map<number, number>();
+  
+  for (const tok of tokens) {
+    const xBucket = Math.floor(tok.x / X_BUCKET_SIZE) * X_BUCKET_SIZE;
+    xHistogram.set(xBucket, (xHistogram.get(xBucket) || 0) + 1);
   }
 
-  // Define columns: [0, gap1, gap2, ..., maxX]
-  const columnBoundaries = [0, ...xGaps, Math.max(...tokens.map(t => t.x + t.w))];
+  // Find valleys (low-density regions) = column boundaries
+  const sortedXBuckets = Array.from(xHistogram.keys()).sort((a, b) => a - b);
+  const columnBoundaries: number[] = [0];
+  
+  for (let i = 1; i < sortedXBuckets.length - 1; i++) {
+    const prev = xHistogram.get(sortedXBuckets[i - 1]) || 0;
+    const curr = xHistogram.get(sortedXBuckets[i]) || 0;
+    const next = xHistogram.get(sortedXBuckets[i + 1]) || 0;
+    
+    // Valley: current bucket has significantly fewer tokens than neighbors
+    if (curr === 0 && (prev > 0 || next > 0)) {
+      const xBoundary = sortedXBuckets[i];
+      // Avoid duplicate boundaries too close together
+      if (columnBoundaries.length === 0 || xBoundary - columnBoundaries[columnBoundaries.length - 1] > 30) {
+        columnBoundaries.push(xBoundary);
+      }
+    }
+  }
+  
+  columnBoundaries.push(Math.max(...tokens.map(t => t.x + t.w)) + 10);
   const columnCount = columnBoundaries.length - 1;
 
   if (columnCount < 2) return { rows: [], columnCount: 0, rowCount: 0 };
 
+  // Step 3: Assign tokens to cells
   const finalRows: TableCell[][] = [];
 
   for (const yKey of sortedYKeys) {
@@ -144,8 +165,11 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
       const xStart = columnBoundaries[c];
       const xEnd = columnBoundaries[c + 1];
       
-      // Find tokens in this cell
-      const cellTokens = rowTokens.filter(t => t.x >= xStart && t.x < xEnd);
+      // Find tokens whose CENTER falls in this column
+      const cellTokens = rowTokens.filter(t => {
+        const centerX = t.x + t.w / 2;
+        return centerX >= xStart && centerX < xEnd;
+      });
       
       let text = "";
       for (const tok of cellTokens) {
@@ -166,6 +190,45 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
     }
 
     finalRows.push(rowCells);
+  }
+
+  // Step 4: Detect and merge cells with colspan/rowspan
+  // Colspan: consecutive empty cells in a row with text in first cell
+  for (let r = 0; r < finalRows.length; r++) {
+    for (let c = 0; c < columnCount; c++) {
+      const cell = finalRows[r][c];
+      if (cell.text.trim().length > 0 && cell.colSpan === 1) {
+        let span = 1;
+        while (c + span < columnCount && finalRows[r][c + span].text.trim().length === 0) {
+          span++;
+        }
+        if (span > 1) {
+          cell.colSpan = span;
+          // Mark spanned cells as merged
+          for (let s = 1; s < span; s++) {
+            finalRows[r][c + s].text = ""; // Clear to avoid duplication
+          }
+        }
+      }
+    }
+  }
+
+  // Rowspan: consecutive rows with same text in same column
+  for (let c = 0; c < columnCount; c++) {
+    for (let r = 0; r < finalRows.length; r++) {
+      const cell = finalRows[r][c];
+      if (cell.text.trim().length > 0 && cell.rowSpan === 1) {
+        let span = 1;
+        while (r + span < finalRows.length && 
+               finalRows[r + span][c].text.trim().length === 0 &&
+               finalRows[r + span][c].tokens.length === 0) {
+          span++;
+        }
+        if (span > 1) {
+          cell.rowSpan = span;
+        }
+      }
+    }
   }
 
   return {
