@@ -117,9 +117,10 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
 
   const sortedYKeys = Array.from(rowGroups.keys()).sort((a, b) => b - a);
   
-  // Step 2: Detect column boundaries via histogram analysis
-  // Build X-histogram: count tokens in each X-bucket
-  const X_BUCKET_SIZE = 3; // Smaller bucket for finer resolution
+  // Step 2: Detect column boundaries via peak analysis
+  // Instead of finding valleys (empty regions), find peaks (dense regions)
+  // and use gaps between peaks as column boundaries
+  const X_BUCKET_SIZE = 10; // Larger bucket to smooth noise
   const xHistogram = new Map<number, number>();
   
   for (const tok of tokens) {
@@ -127,37 +128,29 @@ const reconstructTableByBorders = (tokens: TextToken[]): TableData => {
     xHistogram.set(xBucket, (xHistogram.get(xBucket) || 0) + 1);
   }
 
-  // Find valleys (low-density regions) = column boundaries
   const sortedXBuckets = Array.from(xHistogram.keys()).sort((a, b) => a - b);
+  
+  // Find peaks: buckets with significantly more tokens than neighbors
+  const peaks: number[] = [];
+  for (let i = 1; i < sortedXBuckets.length - 1; i++) {
+    const prev = xHistogram.get(sortedXBuckets[i - 1]) || 0;
+    const curr = xHistogram.get(sortedXBuckets[i]) || 0;
+    const next = xHistogram.get(sortedXBuckets[i + 1]) || 0;
+    
+    // Peak: current bucket has more tokens than both neighbors
+    if (curr > prev && curr > next && curr >= 2) {
+      peaks.push(sortedXBuckets[i]);
+    }
+  }
+
+  console.log(`[Border-based] Found ${peaks.length} peaks at X: [${peaks.map(x => Math.round(x)).join(', ')}]`);
+
+  // Column boundaries are midpoints between consecutive peaks
   const columnBoundaries: number[] = [Math.min(...tokens.map(t => t.x)) - 5];
   
-  // Detect valleys: regions with 0 tokens surrounded by regions with tokens
-  let inValley = false;
-  let valleyStart = -1;
-  
-  for (let i = 0; i < sortedXBuckets.length; i++) {
-    const curr = xHistogram.get(sortedXBuckets[i]) || 0;
-    
-    if (curr === 0 && !inValley) {
-      // Start of valley
-      inValley = true;
-      valleyStart = sortedXBuckets[i];
-    } else if (curr > 0 && inValley) {
-      // End of valley - use middle of valley as boundary
-      const valleyEnd = sortedXBuckets[i];
-      const valleyWidth = valleyEnd - valleyStart;
-      
-      // Only consider valleys wider than 15px (real column gaps)
-      if (valleyWidth > 15) {
-        const xBoundary = valleyStart + valleyWidth / 2;
-        // Avoid duplicate boundaries too close together
-        const lastBoundary = columnBoundaries[columnBoundaries.length - 1];
-        if (xBoundary - lastBoundary > 25) {
-          columnBoundaries.push(xBoundary);
-        }
-      }
-      inValley = false;
-    }
+  for (let i = 0; i < peaks.length - 1; i++) {
+    const midpoint = (peaks[i] + peaks[i + 1]) / 2;
+    columnBoundaries.push(midpoint);
   }
   
   columnBoundaries.push(Math.max(...tokens.map(t => t.x + t.w)) + 5);
