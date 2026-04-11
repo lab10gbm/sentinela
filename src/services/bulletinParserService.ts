@@ -322,16 +322,50 @@ const cleanAndFormatSlice = (
 
   const flushTable = () => {
     if (tableLines.length === 0) return;
-    const hasRealHeader = tableLines.some(l => !l.isBridge && isTableHeader(l.text));
-    const realLines = tableLines.filter(l => !l.isBridge && l.text.trim().length > 0);
+    
+    // Separa títulos/cabeçalhos que não fazem parte da tabela
+    const titleLines: typeof tableLines = [];
+    const actualTableLines: typeof tableLines = [];
+    
+    for (const line of tableLines) {
+      if (line.isBridge) {
+        actualTableLines.push(line);
+        continue;
+      }
+      
+      const plain = line.text.replace(/\*\*/g, '').trim();
+      const isAllCaps = plain === plain.toUpperCase() && plain.length > 15;
+      const hasNoWideGaps = (plain.match(/\s{3,}/g) || []).length === 0;
+      const isTitle = isAllCaps && hasNoWideGaps;
+      
+      // Também detecta cabeçalhos descritivos (ex: "CONCEITO: Os alunos...")
+      const isDescriptiveHeader = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{3,}:/.test(plain) && plain.length > 40;
+      
+      if ((isTitle || isDescriptiveHeader) && actualTableLines.length === 0) {
+        // Título/cabeçalho antes da tabela começar
+        titleLines.push(line);
+      } else {
+        actualTableLines.push(line);
+      }
+    }
+    
+    // Flush títulos como parágrafos
+    if (titleLines.length > 0) {
+      flushParagraph();
+      titleLines.forEach(l => paragraphLines.push(l.text));
+      flushParagraph();
+    }
+    
+    const hasRealHeader = actualTableLines.some(l => !l.isBridge && isTableHeader(l.text));
+    const realLines = actualTableLines.filter(l => !l.isBridge && l.text.trim().length > 0);
     
     if (!hasRealHeader || realLines.length < 2) {
-      tableLines.filter(l => !l.isBridge).forEach(l => paragraphLines.push(l.text));
+      actualTableLines.filter(l => !l.isBridge).forEach(l => paragraphLines.push(l.text));
       tableLines = []; return;
     }
     
     const allTableTokens: TextToken[] = [];
-    tableLines.forEach(line => {
+    actualTableLines.forEach(line => {
       if (line.isBridge) return;
       allTableTokens.push(...line.tokens.filter(t => Math.abs(t.y - line.y) <= 4));
     });
@@ -345,7 +379,7 @@ const cleanAndFormatSlice = (
         const gridLines = data.rows.map(row => row.map(cell => cell.text).join(" | "));
         processedBlocks.push(`\`\`\`grid-tab-${tableIdx}\n` + gridLines.join("\n") + "\n```");
       } else {
-        paragraphLines.push(...tableLines.filter(l => !l.isBridge).map(l => l.text));
+        paragraphLines.push(...actualTableLines.filter(l => !l.isBridge).map(l => l.text));
       }
     }
     tableLines = [];
