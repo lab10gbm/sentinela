@@ -738,6 +738,12 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
     if (!plain) return false;
 
     // ── SINAIS NEGATIVOS FORTES — nunca são tabela ──────────────────────────
+    
+    // Título centralizado em CAIXA ALTA (ex: "CHOAE/2025 - FICHA DE AVALIAÇÃO DE ESTÁGIO")
+    const isAllCaps = plain === plain.toUpperCase() && plain.length > 15;
+    const hasNoGaps = (plain.match(/\s{3,}/g) || []).length === 0;
+    if (isAllCaps && hasNoGaps) return false;
+    
     // Padrões de parágrafo legal/narrativo que nunca são tabela,
     // mesmo que contenham gaps geométricos causados por negrito.
     const isDefinitelyParagraph =
