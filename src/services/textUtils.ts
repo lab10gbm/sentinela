@@ -237,7 +237,18 @@ export const normalizeCellText = (text: string): string => {
     return match;
   });
 
-  // 5. Colapsa múltiplos espaços residuais
+  // 5. Normalização de RG sem ponto: 5-6 dígitos isolados → NN.NNN
+  //    Regra: os últimos 3 dígitos são sempre a parte após o ponto.
+  //    Ex: 53392 → 53.392, 543920 → 54.392 (não aplicar se já tem ponto)
+  s = s.replace(/\b(\d{5,6})\b/g, (match) => {
+    // Só normaliza se não estiver já no formato NN.NNN
+    if (/^\d{1,2}\.\d{3}$/.test(match)) return match;
+    const prefix = match.slice(0, match.length - 3);
+    const suffix = match.slice(-3);
+    return `${prefix}.${suffix}`;
+  });
+
+  // 6. Colapsa múltiplos espaços residuais
   s = s.replace(/\s{2,}/g, ' ').trim();
 
   return s;
@@ -746,7 +757,7 @@ export const isHardLegalParagraph = (text: string): boolean => {
     /^Cumpra[-\s]se/i.test(plain) ||
     // Autoridades e OBMs como intro
     /^\b(O\s+Cel\s+BM|O\s+Comandante|O\s+Diretor|O\s+Chefe|O\s+Subcomandante|O\s+Secretário|O\s+Estado-Maior|O\s+Cel\s+BM\s+Diretor)\b/i.test(plain) ||
-    /^(GMar|GBM|DBM|CER|ABMDP|CEMAR|GBS|GSE|Primeiro\s+Grupamento|Segundo\s+Grupamento)\b/i.test(plain) ||
+    /^(GMar|GBM|DBM|CER|ABMDP|CEMAR|GBS|GSE|Primeiro\s+Grupamento|Segundo\s+Grupamento)\b/i.test(plain) && plain.length < 60 && !/\d{2}\.\d{3}/.test(plain) && !/\d+\//.test(plain) ||
     // Contém "por necessidade de serviço"
     /por\s+necessidade\s+de\s+servi[çc]o/i.test(plain) ||
     // Contém SEI (referência de processo)

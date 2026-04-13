@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { BulletinNota, TableData, StoredBulletin, MilitaryPerson, SearchPreferences } from '../types';
+import { TableValidationReport } from '../services/TableValidator';
 import { BookOpen, ChevronRight, Copy, Check, FileText, Download, Table, ArrowLeft, Calendar, Trash2, Star, Bookmark, X, AlertCircle } from 'lucide-react';
 import SumarioView from './SumarioView';
 import * as XLSX from 'xlsx';
@@ -44,7 +45,8 @@ const StructuredTable: React.FC<{
   searchPrefs?: SearchPreferences;
   onFilteredRowsChange?: (tableIdx: number, rows: TableData['rows']) => void;
   tableIdx?: number;
-}> = ({ data, id, pageNumber, onViewPage, personnel, searchPrefs, onFilteredRowsChange, tableIdx }) => {
+  report?: TableValidationReport;
+}> = ({ data, id, pageNumber, onViewPage, personnel, searchPrefs, onFilteredRowsChange, tableIdx, report }) => {
   const [expanded, setExpanded] = React.useState(false);
   const [showAll, setShowAll] = React.useState(false);
 
@@ -143,6 +145,14 @@ const StructuredTable: React.FC<{
           >
             Tabela Reconstruída {pageNumber !== undefined && `(Pág. ${pageNumber})`}
           </span>
+          {report?.needsManualReview && (
+            <span
+              className="text-[9px] font-bold bg-amber-50 text-amber-700 border border-amber-300 px-2 py-0.5 rounded-full flex items-center gap-1"
+              title={`Score: ${report.overallScore.toFixed(2)} | Tipo: ${report.tableType}${report.columnValidations.flatMap(v => v.issues).length > 0 ? ' | ' + report.columnValidations.flatMap(v => v.issues).slice(0, 2).join('; ') : ''}`}
+            >
+              <AlertCircle className="w-2.5 h-2.5" /> ⚠ Tabela com baixa confiança ({(report.overallScore * 100).toFixed(0)}%)
+            </span>
+          )}
           {isFiltered && (
             <span className="text-[9px] font-black bg-amber-100 text-amber-700 border border-amber-300 px-2 py-0.5 rounded-full">
               ★ {matchedRowIndices!.size} militar{matchedRowIndices!.size !== 1 ? 'es' : ''} do efetivo
@@ -259,7 +269,8 @@ const renderParagraphs = (
   onViewPage?: (page: number) => void,
   personnel?: MilitaryPerson[],
   searchPrefs?: SearchPreferences,
-  onFilteredRowsChange?: (tableIdx: number, rows: TableData['rows']) => void
+  onFilteredRowsChange?: (tableIdx: number, rows: TableData['rows']) => void,
+  tableReports?: TableValidationReport[]
 ) => {
   // CORREÇÃO #2D: Pré-processamento para quebrar linhas com múltiplos campos de formulário
   // Usa formFieldSplitter — fonte única de verdade para esta lógica
@@ -367,6 +378,7 @@ const renderParagraphs = (
             searchPrefs={searchPrefs}
             tableIdx={currentTableIdx ?? undefined}
             onFilteredRowsChange={onFilteredRowsChange}
+            report={currentTableIdx !== null && tableReports ? tableReports[currentTableIdx] : undefined}
           />
         );
       } else {
@@ -968,7 +980,7 @@ const NotasView: React.FC<NotasViewProps> = ({
             <div className="flex gap-4">
               <div className="w-1 rounded-full flex-shrink-0 bg-indigo-50 mt-1" />
               <div className="flex-1 min-w-0">
-                {renderParagraphs(nota.contentMarkdown, nota.tables, nota.id, nota.pageNumber, onViewPage, personnel, searchPrefs, handleFilteredRowsChange)}
+                {renderParagraphs(nota.contentMarkdown, nota.tables, nota.id, nota.pageNumber, onViewPage, personnel, searchPrefs, handleFilteredRowsChange, nota.tableReports)}
               </div>
             </div>
           </div>

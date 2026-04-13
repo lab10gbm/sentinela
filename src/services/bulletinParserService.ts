@@ -23,6 +23,7 @@ import {
 } from "./textUtils";
 import { validateAndReconstruct } from "./TableValidator";
 import { SINGLE_COL_LIST_RE } from "./tableTypes";
+import { tableRegistry } from "./TableRegistry";
 import {
   inferColumnBoundaries,
   isTableContinuation,
@@ -53,7 +54,7 @@ export interface SummaryItem {
   notaNumero?: string;
 }
 
-type PageMapEntry = { page: number; text: string; tokens: TextToken[]; lines: { text: string; y: number }[] };
+type PageMapEntry = { page: number; text: string; tokens: TextToken[]; lines: { text: string; y: number }[]; hasKerningArtifacts?: boolean };
 
 // ──────────────────────────────────────────────
 // EXTRAÇÃO DO BLOCO DO SUMÁRIO (Page-aware)
@@ -305,8 +306,8 @@ export const formatTocForDisplay = (items: SummaryItem[]): string => {
 };
 
 const cleanAndFormatSlice = (
-  lines: { text: string; page: number; tokens: TextToken[]; y: number }[]
-): { text: string; pages: number[]; tables: TableData[] } => {
+  lines: { text: string; page: number; tokens: TextToken[]; y: number; hasKerningPage?: boolean }[]
+): { text: string; pages: number[]; tables: TableData[]; tableReports: import("./TableValidator").TableValidationReport[] } => {
   const detectedPages = new Set<number>();
   lines.forEach(l => detectedPages.add(l.page));
 
@@ -338,8 +339,9 @@ const cleanAndFormatSlice = (
 
   const processedBlocks: string[] = [];
   const paragraphLines: string[] = [];
-  let tableLines: { text: string; tokens: TextToken[]; y: number; isBridge?: boolean }[] = [];
+  let tableLines: { text: string; tokens: TextToken[]; y: number; isBridge?: boolean; hasKerningPage?: boolean }[] = [];
   const foundTables: TableData[] = [];
+  const foundTableReports: import("./TableValidator").TableValidationReport[] = [];
 
   const flushParagraph = () => {
     if (paragraphLines.length === 0) return;
@@ -412,18 +414,22 @@ const cleanAndFormatSlice = (
       return singleChar / tokens.length >= 0.6;
     };
 
+    // Se a página foi marcada como hasKerningArtifacts, aplica filtro em todos os tokens
+    // sem precisar calcular isKerningLine por linha (mais eficiente e mais abrangente)
+    const pageHasKerning = actualTableLines.some(l => (l as any).hasKerningPage === true);
+
     actualTableLines.forEach(line => {
       if (line.isBridge) {
         const plain = line.text.replace(/\*\*/g, '').trim();
         const isCellContinuation = plain.length < 80 && !isHardLegalParagraph(plain);
         if (!isCellContinuation) return;
         const lineTokens = line.tokens.filter(t => Math.abs(t.y - line.y) <= 10);
-        if (isKerningLine(lineTokens)) return; // descarta linha inteira de kerning
+        if (!pageHasKerning && isKerningLine(lineTokens)) return;
         allTableTokens.push(...lineTokens.filter(t => !isKerningArtifact(t)));
         return;
       }
       const lineTokens = line.tokens.filter(t => Math.abs(t.y - line.y) <= 4);
-      if (isKerningLine(lineTokens)) return; // descarta linha inteira de kerning
+      if (!pageHasKerning && isKerningLine(lineTokens)) return;
       allTableTokens.push(...lineTokens.filter(t => !isKerningArtifact(t)));
     });
 
@@ -439,6 +445,7 @@ const cleanAndFormatSlice = (
       );
 
       let data: import("../types").TableData;
+      let report: import("./TableValidator").TableValidationReport | null = null;
       if (isSingleColPersonnelList) {
         const rows = actualTableLines
           .filter(l => !l.isBridge && l.text.trim().length > 0)
@@ -451,6 +458,7 @@ const cleanAndFormatSlice = (
       } else {
         const validated = validateAndReconstruct(uniqueTokens, actualTableLines);
         data = validated.data;
+        report = validated.report;
         if (validated.report.needsManualReview) {
           console.warn(`[TableValidator] Tabela requer revisão manual — score=${validated.report.overallScore.toFixed(2)}, tipo=${validated.report.tableType}`);
         }
@@ -459,6 +467,7 @@ const cleanAndFormatSlice = (
       if (data.columnCount >= 1 && data.rowCount > 0) {
         const tableIdx = foundTables.length;
         foundTables.push(data);
+        foundTableReports.push(report ?? { tableType: 'GENERIC', strategy: 'AUTO', overallScore: 1, columnValidations: [], corrections: [], needsManualReview: false });
         const gridLines = data.rows.map(row => row.map(cell => cell.text).join(" | "));
         processedBlocks.push(`\`\`\`grid-tab-${tableIdx}\n` + gridLines.join("\n") + "\n```");
       } else {
@@ -531,18 +540,14 @@ const cleanAndFormatSlice = (
             let nextTableIdx = -1;
             let containsHardBreak = false;
             let hardBreakIsClosingFormula = false; // "Em consequência..." entre páginas de tabela
-            for (let k = j; k < Math.min(j + 15, lineTypes.length); k++) {
+            for (let k = j; k < Math.min(j + 25, lineTypes.length); k++) {
                 if (lineTypes[k].isTable) { nextTableIdx = k; break; }
                 const plainText = lineTypes[k].obj.text.trim().replace(/\*\*/g, '');
                 if (isSubSectionTitle(plainText) || isRectificationMarker(plainText)) {
                     containsHardBreak = true; break;
                 }
                 if (isHardLegalParagraph(plainText)) {
-                    // Fórmula de encerramento (ex: "Em consequência...") pode aparecer
-                    // entre páginas de uma tabela multi-página — não quebra se o próximo
-                    // bloco de tabela tiver o mesmo cabeçalho (tabela continua na pág seguinte).
                     hardBreakIsClosingFormula = true;
-                    // Continua procurando o próximo bloco de tabela
                 }
             }
 
@@ -570,7 +575,11 @@ const cleanAndFormatSlice = (
                 let looksLikeParagraph = 0;
                 for (let k = j; k < nextTableIdx; k++) {
                     const line = lineTypes[k].obj.text.trim();
-                    if (line.length > 50 && (line.match(/\s/g) || []).length > 8) looksLikeParagraph++;
+                    // Não conta linhas com padrão militar como parágrafo
+                    // (linhas fundidas de dados militares têm muitos espaços mas são tabela)
+                    const hasMilRank = /\b(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel)\s+BM\b/i.test(line);
+                    const hasRG = /\b\d{1,2}\.\d{3}\b/.test(line);
+                    if (!hasMilRank && !hasRG && line.length > 50 && (line.match(/\s/g) || []).length > 8) looksLikeParagraph++;
                 }
 
                 if (bridgeLinesCount < 8 || looksLikeParagraph < 3) {
@@ -593,6 +602,32 @@ const cleanAndFormatSlice = (
   // Após o bridge scan geométrico, verifica se linhas não marcadas como isTable
   // têm padrão de dado militar e estão alinhadas com as boundaries da tabela anterior.
   // Isso captura linhas 18-28+ que saem da tabela após quebra de página.
+
+  /**
+   * Verifica se a linha contém número N próximo ao último número visto na tabela (N-1 a N+2).
+   * Suporta linhas onde o QTD não é o primeiro token (ex: "DBM 3/M - Recreio do 18 Cb BM...").
+   */
+  const detectsSequentialRow = (lineText: string, lastTableRowNumber: number): boolean => {
+    if (lastTableRowNumber <= 0) return false;
+    const plain = lineText.replace(/\*\*/g, "").trim();
+    const tokens = plain.split(/\s+/);
+
+    // Tenta o primeiro token primeiro (caso mais comum)
+    const numFirst = parseInt(tokens[0], 10);
+    if (!isNaN(numFirst) && numFirst >= lastTableRowNumber + 1 && numFirst <= lastTableRowNumber + 3) return true;
+
+    // Procura o número sequencial em qualquer posição, confirmado por posto militar seguinte
+    for (let ti = 0; ti < tokens.length; ti++) {
+      const n = parseInt(tokens[ti], 10);
+      if (isNaN(n)) continue;
+      if (n < lastTableRowNumber + 1 || n > lastTableRowNumber + 3) continue;
+      // Confirma que é seguido de posto/graduação militar
+      const nextTok = tokens[ti + 1] ?? "";
+      if (/^(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel|BM|Q\d)/i.test(nextTok)) return true;
+    }
+    return false;
+  };
+
   {
     // Itera por TODOS os blocos de tabela (não só o último) e tenta estender cada um
     let i = 0;
@@ -608,6 +643,18 @@ const cleanAndFormatSlice = (
       const blockTokens = lineTypes.slice(i, blockEnd).flatMap(lt =>
         lt.obj.tokens.filter(t => Math.abs(t.y - lt.obj.y) <= 5)
       );
+
+      // Extrai o último número de QTD visto no bloco (para detector de sequência)
+      let lastRowNumber = 0;
+      for (let b = blockEnd - 1; b >= i; b--) {
+        const bPlain = lineTypes[b].obj.text.replace(/\*\*/g, "").trim();
+        const firstTok = bPlain.split(/\s+/)[0];
+        const n = parseInt(firstTok, 10);
+        if (!isNaN(n) && n > 0) { lastRowNumber = n; break; }
+      }
+      if (lastRowNumber > 0) {
+        console.log(`[PatternAnalyzer] Pass3 bloco i=${i} blockEnd=${blockEnd} lastRowNumber=${lastRowNumber} próxima="${lineTypes[blockEnd]?.obj.text.substring(0, 60) ?? 'EOF'}"`);
+      }
 
       if (blockTokens.length > 0) {
         const analysis = inferColumnBoundaries(blockTokens);
@@ -627,16 +674,41 @@ const cleanAndFormatSlice = (
 
             const lineTokens = lt.obj.tokens.filter(t => Math.abs(t.y - lt.obj.y) <= 5);
             const hasMilitary = hasMilitaryDataPattern({ text: lt.obj.text, tokens: lineTokens });
-            if (!hasMilitary) continue;
+
+            // Detector de sequência numérica: linha começa com N e último visto foi N-1
+            const isSequential = detectsSequentialRow(lt.obj.text, lastRowNumber);
+
+            // Lookahead: se a linha atual não é militar/sequencial mas a PRÓXIMA é,
+            // esta linha é um prefixo de OBM (ex: "DBM 3/M - Recreio do") — marca como bridge
+            if (!hasMilitary && !isSequential) {
+              const nextLt = lineTypes[k + 1];
+              if (nextLt && !nextLt.isTable) {
+                const nextPlain = nextLt.obj.text.replace(/\*\*/g, "").trim();
+                const nextIsSeq = detectsSequentialRow(nextLt.obj.text, lastRowNumber);
+                const nextLineTokens = nextLt.obj.tokens.filter(t => Math.abs(t.y - nextLt.obj.y) <= 5);
+                const nextHasMil = hasMilitaryDataPattern({ text: nextLt.obj.text, tokens: nextLineTokens });
+                if (nextIsSeq || nextHasMil) {
+                  console.log(`[PatternAnalyzer] Bridge prefixo OBM: linha ${k} "${plain.substring(0, 60)}"`);
+                  lineTypes[k].isTable = true;
+                  lineTypes[k].isBridge = true;
+                }
+              }
+              continue;
+            }
 
             const score = isTableContinuation(
               { text: lt.obj.text, tokens: lineTokens },
               analysis.boundaries
             );
-            if (score >= 0.7) {
-              console.log(`[PatternAnalyzer] Bridge estendido: score=${score.toFixed(2)} linha ${k} "${plain.substring(0, 60)}"`);
+            if (score >= 0.7 || isSequential) {
+              const reason = isSequential ? `seq=${lastRowNumber + 1}` : `score=${score.toFixed(2)}`;
+              console.log(`[PatternAnalyzer] Bridge estendido: ${reason} linha ${k} "${plain.substring(0, 60)}"`);
               lineTypes[k].isTable = true;
               lineTypes[k].isBridge = true;
+              // Atualiza lastRowNumber para encadeamento sequencial
+              const firstTok = plain.split(/\s+/)[0];
+              const n = parseInt(firstTok, 10);
+              if (!isNaN(n) && n > 0) lastRowNumber = n;
             }
           }
         }
@@ -698,7 +770,7 @@ const cleanAndFormatSlice = (
   }
   flushTable(); flushParagraph();
 
-  return { text: processedBlocks.join("\n\n").trim(), pages: Array.from(detectedPages).sort((a, b) => a - b), tables: foundTables };
+  return { text: processedBlocks.join("\n\n").trim(), pages: Array.from(detectedPages).sort((a, b) => a - b), tables: foundTables, tableReports: foundTableReports };
 };
 
 export const extractBulletinLocalAlgo = async (
@@ -715,9 +787,12 @@ export const extractBulletinLocalAlgo = async (
       pm = pageMap;
   }
   
+  // Limpa o registry de boundaries do boletim anterior
+  tableRegistry.clear();
+
   if (onProgress) onProgress(30);
 
-  const allLines: { text: string; page: number; tokens: TextToken[]; y: number }[] = [];
+  const allLines: { text: string; page: number; tokens: TextToken[]; y: number; hasKerningPage?: boolean }[] = [];
   pm.forEach(p => p.lines.forEach(l => {
       let cleanedText = l.text;
       
@@ -735,7 +810,7 @@ export const extractBulletinLocalAlgo = async (
       // Filtra linhas que são cabeçalho/rodapé (inclui letras duplicadas e texto espalhado)
       if (isPageHeaderOrFooter(cleanedText)) return;
       
-      allLines.push({ text: cleanedText, page: p.page, tokens: p.tokens, y: l.y });
+      allLines.push({ text: cleanedText, page: p.page, tokens: p.tokens, y: l.y, hasKerningPage: p.hasKerningArtifacts ?? false });
   }));
 
   const tocRawLines = extractTocBlock(pm);
@@ -1067,9 +1142,9 @@ export const extractBulletinLocalAlgo = async (
 
   if (firstFoundIndex > bodySearchStart) {
     const slice = allLines.slice(bodySearchStart, firstFoundIndex);
-    const { text, pages, tables } = cleanAndFormatSlice(slice);
+    const { text, pages, tables, tableReports } = cleanAndFormatSlice(slice);
     const { isRelevant, matchedEntities, hasFuzzyMatch } = checkRelevance(text);
-    if (text.trim().length > 10) notas.push({ id: crypto.randomUUID(), title: "ABERTURA DO BOLETIM", hierarchy: "Abertura do Boletim", contentMarkdown: text, tables, pageNumber: pages[0], isRelevant, matchedEntities, hasFuzzyMatch });
+    if (text.trim().length > 10) notas.push({ id: crypto.randomUUID(), title: "ABERTURA DO BOLETIM", hierarchy: "Abertura do Boletim", contentMarkdown: text, tables, tableReports, pageNumber: pages[0], isRelevant, matchedEntities, hasFuzzyMatch });
   }
 
   const REGEX_NEXT_NOTA = /^\*{0,2}\d+[.\s]/;
@@ -1130,7 +1205,7 @@ export const extractBulletinLocalAlgo = async (
     const slice = allLines.slice(start + titleLinesConsumed, end + 1).map(l => ({
       text: l.text, page: l.page, tokens: l.tokens, y: l.y
     }));
-    const { text, pages, tables } = cleanAndFormatSlice(slice);
+    const { text, pages, tables, tableReports } = cleanAndFormatSlice(slice);
     const { isRelevant, matchedEntities, hasFuzzyMatch } = checkRelevance(text + " " + rawTitle);
 
     // displayHierarchy
@@ -1172,6 +1247,7 @@ export const extractBulletinLocalAlgo = async (
       hierarchyPath,
       contentMarkdown: text,
       tables,
+      tableReports,
       pageNumber: pages.length > 0 ? pages[0] : undefined,
       isHeaderOnly: isStructuralHeader && text.trim().length < 5,
       isRelevant,

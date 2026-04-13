@@ -2,6 +2,7 @@ import { TextToken, TableData, TableCell } from "../types";
 import { isTableHeader, normalizeCellText, normalizeTitle } from "./textUtils";
 import { getSemanticScore, MILITARY_RANK_RE, MILITARY_CADRE_RE } from "./tableTypes";
 import { inferColumnBoundaries } from "./TablePatternAnalyzer";
+import { tableRegistry } from "./TableRegistry";
 
 /**
  * TableReconstructor v5
@@ -377,19 +378,18 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
       const visualYLines: number[] = [];
       
       for (const b of yBuckets) {
-        // Se a distância for maior que 7px, tratamos como uma nova linha.
-        // Reduzido de 8 para 7 para evitar fusão de linhas muito próximas no COESCI.
-        if (visualYLines.length === 0 || Math.abs(b - visualYLines[visualYLines.length-1]) > 7) {
+        // Se a distância for maior que 5px, tratamos como uma nova linha.
+        // Reduzido de 7 para 5 para separar militares em linhas adjacentes (ex: COESCI).
+        if (visualYLines.length === 0 || Math.abs(b - visualYLines[visualYLines.length-1]) > 5) {
           visualYLines.push(b + Y_BUCKET_SIZE / 2);
         } else {
-          // Se estiver perto, atualiza o centro (topo da linha é mais estável)
           visualYLines[visualYLines.length-1] = Math.max(visualYLines[visualYLines.length-1], b + Y_BUCKET_SIZE / 2);
         }
       }
       
       for (const y of visualYLines) {
-        // Tolerância de captura reduzida para 5px para evitar "puxar" tokens da linha de baixo
-        const lineTokens = pageTokens.filter(t => Math.abs(t.y - y) <= 5);
+        // Tolerância de captura reduzida para 3px para evitar "puxar" tokens da linha adjacente
+        const lineTokens = pageTokens.filter(t => Math.abs(t.y - y) <= 3);
         if (lineTokens.length > 0) {
           rawLines.push({ y, page: pageNum, tokens: lineTokens });
         }
@@ -512,8 +512,11 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
           }
 
           const allPhysical = anchorPositions.every(ap => ap.xLeft >= 0);
+          // Verifica se as posições físicas são distintas (não todas no mesmo token)
+          const uniqueXPositions = new Set(anchorPositions.filter(ap => ap.xLeft >= 0).map(ap => ap.xLeft));
+          const hasDistinctPositions = uniqueXPositions.size >= anchorPositions.length - 1;
 
-          if (allPhysical) {
+          if (allPhysical && hasDistinctPositions) {
             // Usa posições físicas reais — cada âncora ocupa do seu xLeft até o xLeft da próxima
             anchorPositions.sort((a, b) => a.xLeft - b.xLeft);
             for (let fIdx = 0; fIdx < anchorPositions.length; fIdx++) {
@@ -711,7 +714,17 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     return !Array.from(headerYValues).some(hy => Math.abs(roundedY - hy) <= 8);
   });
 
-  const patternAnalysis = inferColumnBoundaries(dataOnlyTokens);
+  const patternAnalysis = (() => {
+    // Consulta o registry antes de inferir — se houver boundaries salvas para páginas
+    // próximas (±3), usa diretamente para garantir consistência entre páginas da mesma tabela.
+    const refPage = dataOnlyTokens[0]?.page ?? 0;
+    const cached = refPage > 0 ? tableRegistry.lookup(refPage, "MILITARY_PERSONNEL") : null;
+    if (cached && cached.length >= 3) {
+      console.log(`[TableReconstructor] Registry hit: usando ${cached.length} boundaries da página ${refPage}`);
+      return { boundaries: cached, sampledLines: 0, confidence: 1.0 };
+    }
+    return inferColumnBoundaries(dataOnlyTokens);
+  })();
 
   // MODO AUTORITATIVO: PatternAnalyzer detectou mais colunas que o templateLine
   // (cabeçalho empilhado mal explodido). Usa as boundaries dos dados como fonte de verdade
@@ -947,10 +960,22 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     }
 
     // Sem colisão → merge normal (preenche células vazias)
+    // EXCEÇÃO: se a linha atual tem apenas NOME preenchido com nome próprio em CAIXA ALTA
+    // e a linha anterior já tem NOME preenchido, é um novo militar — não faz merge.
     if (collisionCols === 0) {
+      const nomeColIdx = columnDef.findIndex(d => d.originalHeader.replace(/\*\*/g, '').toUpperCase().includes('NOME'));
+      if (nomeColIdx >= 0) {
+        const currNome = currentRow[nomeColIdx]?.text.trim() ?? '';
+        const lastNome = lastRow[nomeColIdx]?.text.trim() ?? '';
+        const currOnlyNome = currFilled === 1 && currentRow[nomeColIdx]?.text.length > 0;
+        const currIsFullName = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,}(\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,})+$/.test(currNome);
+        if (currOnlyNome && currIsFullName && lastNome.length > 0) {
+          mergedRows.push(currentRow);
+          continue;
+        }
+      }
       for (let c = 0; c < columnCount; c++) {
         if (currentRow[c].text.length > 0) {
-          // Concatena em vez de atribuir, mantendo qualquer valor anterior
           lastRow[c].text = (lastRow[c].text + " " + currentRow[c].text).trim();
           lastRow[c].tokens.push(...currentRow[c].tokens);
         }
@@ -993,8 +1018,12 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         // Caso 7: linha anterior não termina com pontuação forte...
         const prevEndsClean = !/[.;!?]$/.test(prev);
         // Nova entrada: começa com posto/graduação militar OU número de item de lista
+        // OU nome próprio em CAIXA ALTA completo na coluna NOME (novo militar)
         const currIsNewEntry = /^(Cap|Ten|Cel|Maj|Sgt|Cb|Sd|BM)\s/i.test(t) ||
-                               /^\d+[.)]\s/.test(t);
+                               /^\d+[.)]\s/.test(t) ||
+                               (isNameOrObm && hType.includes("NOME") &&
+                                /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,}(\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,})+$/.test(t) &&
+                                t.split(/\s+/).length >= 2);
         if (prevEndsClean && !currIsNewEntry && t.length < 80) return true;
 
         return false;

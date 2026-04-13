@@ -82,7 +82,8 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
     page: number; 
     text: string; 
     tokens: TextToken[];
-    lines: { text: string; y: number }[] 
+    lines: { text: string; y: number }[];
+    hasKerningArtifacts?: boolean;
   }[] 
 }> => {
   // Use dynamic import to avoid evaluation crashes in Webpack/Next.js setup
@@ -280,6 +281,15 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
       }
     }
 
+    // Detecta páginas com fontes TrueType corrompidas (artefatos de kerning).
+    // Se > 30% dos tokens têm text.length === 1, a página tem kerning problemático.
+    // O flag é propagado ao PageMapEntry e usado em flushTable para filtrar automaticamente.
+    const singleCharCount = tokens.filter((t: any) => t.text.trim().length === 1).length;
+    const hasKerningArtifacts = tokens.length > 0 && (singleCharCount / tokens.length) > 0.30;
+    if (hasKerningArtifacts) {
+      console.log(`[Sentinela] Página ${i}: hasKerningArtifacts=true (${singleCharCount}/${tokens.length} tokens de 1 char = ${(singleCharCount/tokens.length*100).toFixed(0)}%)`);
+    }
+
     // Agrupamento por Linhas Visuais (Y-tolerance de 4px para maior precisão)
     const linesBuckets = new Map<number, any[]>();
     tokens.forEach((t: any) => {
@@ -376,7 +386,8 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
       text: pageTextWithImages,
       tokens,
       lines: processedLines, // Usa processedLines em vez de sortedLines
-      isOcr: isOcrDerived
+      isOcr: isOcrDerived,
+      hasKerningArtifacts,
     });
   }
   

@@ -30,6 +30,8 @@ import {
   classifyTableType,
   COLUMN_VALIDATION_PATTERNS,
 } from "./tableTypes";
+import { inferColumnBoundaries } from "./TablePatternAnalyzer";
+import { tableRegistry } from "./TableRegistry";
 
 // ─── Tipos públicos ──────────────────────────────────────────────────────────
 
@@ -260,6 +262,17 @@ export const validateAndReconstruct = (
   }
   if (corrections.length > 0) {
     console.log(`[TableValidator] Correções:`, corrections);
+  }
+
+  // Salva boundaries no registry se MILITARY_PERSONNEL com score ≥ 0.9 e 6 colunas
+  if (tableType === "MILITARY_PERSONNEL" && bestScore >= 0.9 && bestData.columnCount === 6) {
+    const refPage = tokens[0]?.page ?? 0;
+    if (refPage > 0) {
+      const analysis = inferColumnBoundaries(tokens);
+      if (analysis.boundaries.length === 6) {
+        tableRegistry.save(refPage, tableType, analysis.boundaries);
+      }
+    }
   }
 
   return {

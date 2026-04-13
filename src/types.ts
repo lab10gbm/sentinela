@@ -1,4 +1,6 @@
 
+import { TableValidationReport } from "./services/TableValidator";
+
 export interface MilitaryPerson {
   nomeCompleto: string;
   nomeGuerra?: string; 
@@ -83,6 +85,7 @@ export interface BulletinNota {
   hierarchyPath?: string[];
   contentMarkdown: string;
   tables?: TableData[];
+  tableReports?: TableValidationReport[];
   pageNumber?: number;
   isHeaderOnly?: boolean;
   isRelevant?: boolean;
