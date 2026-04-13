@@ -652,10 +652,6 @@ const cleanAndFormatSlice = (
         const n = parseInt(firstTok, 10);
         if (!isNaN(n) && n > 0) { lastRowNumber = n; break; }
       }
-      if (lastRowNumber > 0) {
-        console.log(`[PatternAnalyzer] Pass3 bloco i=${i} blockEnd=${blockEnd} lastRowNumber=${lastRowNumber} próxima="${lineTypes[blockEnd]?.obj.text.substring(0, 60) ?? 'EOF'}"`);
-      }
-
       if (blockTokens.length > 0) {
         const analysis = inferColumnBoundaries(blockTokens);
         if (analysis.confidence >= 0.4 && analysis.boundaries.length >= 3) {
