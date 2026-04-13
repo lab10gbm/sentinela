@@ -17,8 +17,10 @@ export interface TextToken {
   h: number;
   page?: number;
   isBold?: boolean;
+  isItalic?: boolean;
   isUnderlined?: boolean;
   fontSize?: number;
+  fontName?: string; // Nome interno da fonte (usado para análise estatística de negrito)
 }
 
 export interface TableCell {
@@ -44,6 +46,7 @@ export interface SearchPreferences {
   useNomeGuerra: boolean;
   rgFormat5Digit: boolean;
   rgFormat7Digit: boolean;
+  unitOnly?: boolean;
 }
 
 export enum MatchType {
@@ -84,6 +87,8 @@ export interface BulletinNota {
   isHeaderOnly?: boolean;
   isRelevant?: boolean;
   matchedEntities?: string[];
+  /** Indica se algum match de militar foi realizado via lógica Fuzzy (Roxo) */
+  hasFuzzyMatch?: boolean;
   /** Emissor da nota (ex: "CI/JD", "DGP/GAB.DIR.", "DI/DIV.INST/CSMONT") */
   notaEmissor?: string;
   /** Número/ano da nota (ex: "123/2026") */
@@ -111,5 +116,14 @@ export interface SavedNota {
   notaContent: string;
   bulletinFilename: string;
   savedAt: string;
+  category: 'error' | 'relevant';
+  isTableRow?: boolean;
   observation?: string;
+  /** Metadados técnicos para diagnóstico de precisão do motor. */
+  diagnosticData?: {
+    rawSourceTokens?: TextToken[];
+    originalOcrText?: string;
+    isOcrDerived?: boolean;
+    geometricHash?: string;
+  };
 }

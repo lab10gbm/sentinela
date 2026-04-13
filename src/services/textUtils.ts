@@ -8,6 +8,8 @@
 
 import { TextToken } from "../types";
 import { calibrationService } from "./calibrationService";
+import { hasMultipleFormFields, isFormFieldLine } from "../core/text/formFieldSplitter";
+import { SINGLE_COL_LIST_RE } from "./tableTypes";
 
 // ──────────────────────────────────────────────
 // TOC (SUMÁRIO) — TIPOS E INTERFACES
@@ -209,13 +211,13 @@ export const normalizeCellText = (text: string): string => {
   s = s.replace(/\b(\d)\s+(\d{1,2}h)\b/gi, '$1$2');
 
   // 2. Números decimais/RG quebrados: "32.7 08" → "32.708", "32.6 18" → "32.618"
-  //    Só une se o fragmento após o espaço é puramente numérico e curto (≤ 4 dígitos)
-  s = s.replace(/(\d+\.\d+)\s+(\d{1,4})(?=\s|$)/g, (match, left, right) => {
-    // Evita unir se o número da direita parece ser um campo separado (ex: RG separado por coluna)
-    // Heurística: une apenas se o fragmento direito tem ≤ 3 dígitos
-    if (right.length <= 3) return left + right;
-    return match;
-  });
+  //    Também cobre: "45. 32 0" → "45.320" (ponto solto + fragmentos separados)
+  //    Passo 2a: "45. 32" → "45.32" (ponto solto seguido de dígitos, em qualquer posição)
+  s = s.replace(/(\d+)\.\s+(\d+)/g, '$1.$2');
+  //    Passo 2b: "32.7 08" → "32.708" (fragmento decimal + dígitos curtos ≤ 3)
+  s = s.replace(/(\d+\.\d+)\s+(\d{1,3})(?=\s|$)/g, '$1$2');
+  //    Passo 2c: segunda passagem para casos encadeados (ex: "45.32 0" → "45.320")
+  s = s.replace(/(\d+\.\d+)\s+(\d{1,3})(?=\s|$)/g, '$1$2');
 
   // 3. Fragmentos alfanuméricos quebrados: "Dent/0 2" → "Dent/02", "QOS/Dent/0 2" → "QOS/Dent/02"
   //    Padrão: texto terminando em dígito + "/" + dígito(s) + espaço + dígito(s) curtos
@@ -314,10 +316,27 @@ export const calcTocDensity = (lines: string[]): number => {
  */
 export const isPageHeaderOrFooter = (text: string): boolean => {
   const clean = text.trim().toUpperCase();
+  if (!clean) return false;
+
+  // EXCEÇÃO DE OURO: Se a linha parece um cabeçalho de tabela legítimo, NUNCA é lixo de página.
+  // Isso protege tabelas que começam bem no topo ou pé da página.
+  const up = clean.replace(/\*\*/g, '');
+  if (up.includes("QTD") && (up.includes("NOME") || up.includes("POSTO") || up.includes("RG") || up.includes("OBM"))) {
+    return false;
+  }
+
   if (/^(BOLETIM|FL\.|PÁG|CONTINUAÇÃO|SUMÁRIO|RIODEJANEIRO|ESTADO DO RIO|CORPO DE BOMBEIROS)/.test(clean)) return true;
   if (/^FL\.\s*\d+/.test(clean)) return true;
+  
+  // Texto com letras separadas por espaço: "B O L E T I M"
   if (/^(?:[A-Z]\s+){4,}[A-Z]/.test(clean)) return true;
   if (/(?:B\s*){2}(?:O\s*){2}/.test(clean)) return true;
+
+  // Letras duplicadas consecutivas (artefato de kerning do PDF)
+  // Só filtra se não houver palavras úteis de tabela no meio.
+  const letterDupPairs = (clean.match(/([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ])\1/g) || []).length;
+  if (letterDupPairs >= 4 && !up.includes("NOME") && !up.includes("RG")) return true;
+  
   return false;
 };
 
@@ -339,7 +358,8 @@ export const isRectificationMarker = (text: string): boolean => {
  */
 export const isSubSectionTitle = (text: string): boolean => {
   const clean = text.trim().toUpperCase();
-  return /^\d+[\s.]+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ].*:$/.test(clean);
+  // Suporta numeração com ponto ou parêntese (ex: "1. TÍTULO:", "1) TÍTULO:")
+  return /^\d+[\s.)]+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ].*:$/.test(clean);
 };
 
 // ──────────────────────────────────────────────
@@ -379,6 +399,9 @@ export const formatOfficialDocumentText = (fullSectionContent: string): string =
 /**
  * Une linhas que foram quebradas indevidamente por causa do PDF.
  * Baseia-se em heurísticas de pontuação e CAIXA BAIXA na linha seguinte.
+ * 
+ * CORREÇÃO #2: Detecta linhas de dados de formulário (padrão "Palavra:") e as preserva como lista.
+ * CORREÇÃO #2B: Quebra linhas com múltiplos campos de dados (ex: "Data:... Horário:... Local:...")
  */
 export const joinWrappedParagraphs = (text: string): string => {
   if (!text) return "";
@@ -386,9 +409,18 @@ export const joinWrappedParagraphs = (text: string): string => {
   const result: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    const current = lines[i].trim();
+    const raw = lines[i]; // linha sem trim para detectar indentação
+    const current = raw.trim();
     const next = (i + 1 < lines.length) ? lines[i + 1].trim() : null;
+    // Se a próxima linha é um marcador de parágrafo, trata como se não houvesse próxima linha
+    const nextEffective = (next === '\x00PARABREAK\x00') ? null : next;
 
+    // Marcador explícito de quebra de parágrafo (inserido pelo cleanAndFormatSlice via Y-gap).
+    // NUNCA descartado — sempre vira linha vazia no output.
+    if (current === '\x00PARABREAK\x00') {
+      result.push("");
+      continue;
+    }
     // Linha vazia: só preserva se a linha anterior termina com pontuação forte
     // ou é um header — caso contrário, une com a próxima (era quebra de linha do PDF)
     if (!current) {
@@ -406,49 +438,124 @@ export const joinWrappedParagraphs = (text: string): string => {
     // Remove marcadores de formatação para testar pontuação real
     const currentPlain = current.replace(/\*\*/g, '').replace(/\*/g, '').trim();
     const endsWithStrongPunctuation = /[.:;!?]$/.test(currentPlain);
-    const isListItem = /^(\d+|[a-z]|[IVX]+)[\s.-]/.test(current);
+    // Inclui "- " como marcador de lista (ex: "- Ten Cel BM QOC/00 EULER...")
+    const isListItem = /^(\d+[.)]\s|\d+\s+-\s+|[a-z][.)]\s|[IVX]+[.)]\s|-\s+\S)/.test(current);
     const isTableLine = current.includes('|') || current.startsWith('```');
     const isImage = current.includes('![Img]') || current.includes('![Imagem');
+
+    // Continuação de referência incompleta: linha anterior termina com sigla que exige número
+    // (ex: "PINHEIRO, RG" + "31.365;" — quebra de página no meio de dado de militar)
+    const prevResult = result.length > 0 ? result[result.length - 1] : "";
+    const prevResultPlain = prevResult.replace(/\*\*/g, '').trim();
+    const prevEndsWithIncompleteRef = /\b(RG|Id|nº|n°|n\.|Art\.|§)\s*$/i.test(prevResultPlain) ||
+      /,\s*RG\s*$/i.test(prevResultPlain);
+    if (prevEndsWithIncompleteRef && /^\d/.test(currentPlain)) {
+      // Une diretamente com a linha anterior no result
+      result[result.length - 1] = prevResult + currentPlain;
+      continue;
+    }
+    
+    // Usa formFieldSplitter — fonte única de verdade para detecção de campos
+    const isFormDataLine = isFormFieldLine(current);
+    const hasMultipleFields = hasMultipleFormFields(current);
+    
+    // CORREÇÃO #2F: Linha com indentação de 4 espaços (criada pela quebra no formFieldSplitter)
+    // Essas linhas NUNCA devem ser unidas com outras
+    // IMPORTANTE: usa `raw` (sem trim) para detectar a indentação
+    const hasFormIndentation = /^    /.test(raw);
+    
+    // Log diagnóstico para linhas com campos de formulário
+    if (isFormDataLine || hasMultipleFields) {
+      // Descomente para diagnóstico: console.log(`[joinWrappedParagraphs] campo="${currentPlain.substring(0,80)}" isFormDataLine=${isFormDataLine} hasMulti=${hasMultipleFields}`);
+    }
+    
     // Linha de dados de militar: contém RG com número, Id Funcional, ou padrão "NOME RG NÚMERO"
-    const isMilitaryDataLine = /\bRG\s+\d/.test(current) || /Id\s*Funcional\s+\d/i.test(current) || /,\s*RG\b/i.test(current);
+    // Só considera linha de dados se for curta (< 80 chars) — linhas longas são parágrafos narrativos
+    const isMilitaryDataLine = currentPlain.length < 80 && (
+      /\bRG\s+\d/.test(current) || /Id\s*Funcional\s+\d/i.test(current) || /,\s*RG\b/i.test(current)
+    );
+
+    // Palavras que SEMPRE iniciam um novo parágrafo em documentos oficiais militares.
+    // A linha atual NUNCA deve ser unida com a próxima se a próxima começa com uma dessas.
+    const OFFICIAL_PARAGRAPH_STARTERS = /^(Considerando\b|Art\.\s*\d|Parágrafo\s+único|§\s*\d|Resolve[:\s]|RESOLVE[:\s]|Em\s+conseq|Torna\s+P[úu]blica|O\s+Cel\s+BM\b|O\s+Subcomandante\b)/;
+    const nextStartsNewParagraph = nextEffective ? OFFICIAL_PARAGRAPH_STARTERS.test(nextEffective.replace(/\*\*/g, '')) : false;
 
     // MÁXIMO RIGOR: Se for título (CAIXA ALTA), NUNCA une com a linha de baixo
     // a menos que a linha de baixo seja minúscula (continuação improvável para títulos)
-    if (isHeader && next && !/^[a-zÀ-ü]/.test(next)) {
+    if (isHeader && nextEffective && !/^[a-zÀ-ü]/.test(nextEffective)) {
       result.push(current);
       continue;
     }
 
-    // Linha de dados de militar nunca é unida com a próxima
-    if (isMilitaryDataLine) {
+    // Linha de dados de militar ou formulário nunca é unida com a próxima
+    // CORREÇÃO #2F: Inclui linhas com indentação de formulário
+    if (isMilitaryDataLine || isFormDataLine || hasFormIndentation) {
       result.push(current);
+      // Mesmo para linhas militares: se termina com ponto e próxima começa com maiúscula, separa
+      if (endsWithStrongPunctuation && nextEffective) {
+        const nextPlain = nextEffective.replace(/\*\*/g, '').trim();
+        if (/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]/.test(nextPlain) && !/^[a-zÀ-ü]/.test(nextPlain) &&
+            !/^(\d+|[a-z]|[IVX]+)[\s.-]/.test(nextPlain) &&
+            !nextEffective.includes('|') && !nextEffective.startsWith('```')) {
+          result.push("");
+        }
+      }
       continue;
     }
 
-    if (!endsWithStrongPunctuation && !isListItem && !isTableLine && !isImage && next) {
-      const nextIsListItem = /^(\d+|[a-z]|[IVX]+)[\s.-]/.test(next);
-      const nextIsTable = next.includes('|') || next.startsWith('```');
-      const nextIsImage = next.includes('![Img]') || next.includes('![Imagem');
-      const nextIsLower = /^[a-zÀ-ü]/.test(next);
+    if (!endsWithStrongPunctuation && !isTableLine && !isImage && nextEffective) {
+      // nextIsListItem: número/letra seguido de ponto, parêntese ou hífen — não de espaço+parêntese
+      const nextIsListItem = /^(\d+[.)]\s|\d+\s+-\s+|[a-z][.)]\s|[IVX]+[.)]\s|-\s+\S)/.test(nextEffective);
+      const nextIsTable = nextEffective.includes('|') || nextEffective.startsWith('```');
+      const nextIsImage = nextEffective.includes('![Img]') || nextEffective.includes('![Imagem');
+      const nextIsLower = /^[a-zÀ-ü]/.test(nextEffective);
       // Fragmento curto: só considera se NÃO for header (evita unir títulos em CAIXA ALTA)
       const currentIsShortFragment = !isHeader && current.replace(/\*\*/g, '').length < 25 && !endsWithStrongPunctuation;
 
       if (!nextIsListItem && !nextIsTable && !nextIsImage) {
+        // Nunca une se a próxima linha inicia um parágrafo de documento oficial
+        if (nextStartsNewParagraph) {
+          result.push(current);
+          continue;
+        }
         // Une se: próxima começa com minúscula, OU linha atual é fragmento curto sem pontuação
-        if (nextIsLower || currentIsShortFragment) {
-          lines[i + 1] = current + " " + next;
+        // Para itens de lista: só une se a próxima começa com minúscula (continuação da frase)
+        // Exceção: linha termina com preposição/artigo → sempre é continuação, une independente
+        // Exceção 2: item de lista "- " cuja próxima linha é continuação (não começa com "- " nem é novo item)
+        const endsWithPreposition = /\b(pela|pelo|pelos|pelas|da|do|das|dos|de|a|o|e|em|no|na|nos|nas|com|para|ao|aos|às|por|sob|sobre|entre|até|após|ante|perante|mediante|conforme|segundo|durante|exceto|salvo|inclusive|exclusive|via)\s*$/i.test(currentPlain);
+        const isDashListItem = /^-\s+\S/.test(current);
+        const nextIsDashListItem = /^-\s+\S/.test(nextEffective);
+        // Continuação de item "- ": próxima não é novo item de lista e não é header
+        const isDashContinuation = isDashListItem && !nextIsListItem && !isVisualHeader(nextEffective) && !nextIsDashListItem;
+        if (nextIsLower || endsWithPreposition || (!isListItem && currentIsShortFragment) || isDashContinuation) {
+          lines[i + 1] = current + " " + nextEffective;
           continue;
         }
         
-        // Se as duas linhas são normais (não-header), une (fluxo de parágrafo)
-        if (!isHeader && !isVisualHeader(next) && next.length > 0) {
-          lines[i + 1] = current + " " + next;
+        // Se as duas linhas são normais (não-header, não-lista), une (fluxo de parágrafo)
+        if (!isHeader && !isListItem && !isVisualHeader(nextEffective) && nextEffective.length > 0) {
+          lines[i + 1] = current + " " + nextEffective;
           continue;
         }
       }
     }
 
     result.push(current);
+
+    // Se a linha atual termina com ponto final E a próxima começa com maiúscula
+    // (novo parágrafo sem espaço extra no PDF), inserir separador de parágrafo.
+    // Condição: próxima não é continuação (minúscula), não é lista, não é tabela.
+    if (endsWithStrongPunctuation && nextEffective && !isTableLine && !isImage) {
+      const nextPlain = nextEffective.replace(/\*\*/g, '').trim();
+      const nextIsLower = /^[a-zÀ-ü]/.test(nextPlain);
+      const nextIsListItem = /^(\d+|[a-z]|[IVX]+)[\s.-]/.test(nextPlain);
+      const nextIsDashItem = /^-\s+\S/.test(nextPlain);
+      const nextIsTable = nextEffective.includes('|') || nextEffective.startsWith('```');
+      const nextStartsUpper = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]/.test(nextPlain);
+      if ((nextStartsUpper && !nextIsLower && !nextIsListItem && !nextIsTable) || nextIsDashItem) {
+        result.push("");
+      }
+    }
   }
 
   return result.join('\n').replace(/\n{3,}/g, '\n\n');
@@ -614,79 +721,32 @@ export const detectLayoutSignature = (tokens: TextToken[]): { verticalAxes: numb
 };
 
 /**
- * Reconstrói o texto a partir de tokens usando Gap Analysis (Next Gen).
- * Abandona a dependência de \n e foca no espaçamento visual.
- */
-export const reconstructVisualParagraphs = (tokens: TextToken[]): string => {
-  const lines = groupTokensIntoVisualLines(tokens);
-  if (lines.length === 0) return "";
-
-  const resultLines: string[] = [];
-  let currentParagraphLines: string[] = [];
-
-  // Calcula o gap mediano entre linhas para detectar quebras de parágrafo
-  const lineGaps: number[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const gap = lines[i - 1].y - lines[i].y;
-    if (gap > 0 && gap < 100) lineGaps.push(gap);
-  }
-  lineGaps.sort((a, b) => a - b);
-  const medianGap = lineGaps.length > 0 ? lineGaps[Math.floor(lineGaps.length * 2 / 3)] : 12;
-  const paragraphThreshold = medianGap * 1.5;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    let lineText = "";
-    
-    // Reconstroi a linha baseada em gaps horizontais
-    for (let j = 0; j < line.tokens.length; j++) {
-      const tok = line.tokens[j];
-      let t = tok.isBold ? `**${tok.text}**` : tok.text;
-      if (tok.isUnderlined) t = `<u>${t}</u>`;
-      
-      lineText += t;
-      
-      if (j < line.tokens.length - 1) {
-        const next = line.tokens[j+1];
-        const gap = next.x - (tok.x + tok.w);
-        if (gap > 30) lineText += "    ";
-        else if (gap > 10) lineText += "  ";
-        else if (gap > 2) lineText += " ";
-      }
-    }
-
-    // Checa por quebra de parágrafo visual
-    if (i > 0) {
-      const vGap = lines[i-1].y - line.y;
-      const isIndented = line.tokens[0].x > (lines[0].tokens[0].x + 20); // Simples heurística de identação
-      
-      if (vGap > paragraphThreshold || isIndented) {
-        resultLines.push(currentParagraphLines.join(" "));
-        currentParagraphLines = [];
-      }
-    }
-    
-    currentParagraphLines.push(lineText.trim());
-  }
-
-  if (currentParagraphLines.length > 0) {
-    resultLines.push(currentParagraphLines.join(" "));
-  }
-
-  return resultLines.join("\n\n");
-};
-
-
-/**
  * Detecta linhas que são DEFINITIVAMENTE parágrafos legais/narrativos (nunca tabela).
  */
 export const isHardLegalParagraph = (text: string): boolean => {
   const plain = text.trim().replace(/\*\*/g, '');
+  
   return (
+    // Título de nota ou edital (ex: "1. CURSO DE...")
+    /^\d+[.\s]+.*(CURSO|RELAÇÃO|EDITAL|NOTA|PROGRAMA|PLANO|INSCRIÇÃO|CONVOCAÇÃO|RESULTADO|GABARITO|ATA|PORTARIA|RESOLUÇÃO|DESPACHO)/i.test(plain) ||
     // Numeração hierárquica de documento (1.1., 1.1.1.)
     /^\d+\.\d+\.?\s/.test(plain) ||
+    // Fórmulas fixas de introdução militar (TORNA PÚBLICA, RESOLVE, DETERMINA)
+    /^\b(TORNA\s+PÚBLICA|TORNA\s+SEM\s+EFEITO|RESOLVE|DETERMINA|DESIGNA|CONCEDE|RETIFICA|ADITA|AUTORIZA|PROMOVE|INCLUI|EXCLUI|TRANSFERE|RESERVA|APOSENTA|CONVOCAR|TORNA\s+INSUFICIENTE|CONSIDERANDO)\b/i.test(plain) ||
+    // Introdução de notas de instrução/curso
+    /\b(relação\s+de\s+inscritos|processo\s+seletivo|à\s+saber:|conforme\s+segue\b|nos\s+termos\s+da\b|em\s+epígrafe\b|publicada\s+no\s+Boletim\b)/i.test(plain) ||
     // Começa com preposição/artigo (continuação de parágrafo)
     /^(e |de |do |da |dos |das |no |na |nos |nas |com |para |pelo |pela |pelos |pelas |ao |aos |às )/i.test(plain) ||
+    // Fórmulas de encerramento de documento oficial
+    /^Em\s+conseq/i.test(plain) ||
+    /^Em\s+aten[çc]/i.test(plain) ||
+    /^Em\s+cumprimento/i.test(plain) ||
+    /^Registre[-\s]se/i.test(plain) ||
+    /^Publique[-\s]se/i.test(plain) ||
+    /^Cumpra[-\s]se/i.test(plain) ||
+    // Autoridades e OBMs como intro
+    /^\b(O\s+Cel\s+BM|O\s+Comandante|O\s+Diretor|O\s+Chefe|O\s+Subcomandante|O\s+Secretário|O\s+Estado-Maior|O\s+Cel\s+BM\s+Diretor)\b/i.test(plain) ||
+    /^(GMar|GBM|DBM|CER|ABMDP|CEMAR|GBS|GSE|Primeiro\s+Grupamento|Segundo\s+Grupamento)\b/i.test(plain) ||
     // Contém "por necessidade de serviço"
     /por\s+necessidade\s+de\s+servi[çc]o/i.test(plain) ||
     // Contém SEI (referência de processo)
@@ -697,6 +757,8 @@ export const isHardLegalParagraph = (text: string): boolean => {
     /\bnomeando\b/i.test(plain) ||
     // Linha narrativa longa terminando em ponto com múltiplas vírgulas (parágrafo)
     (plain.length > 80 && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) ||
+    // Linha que parece título de nota (começa com número e tem palavras de documento)
+    /^\d+[.\s]+.*(NOTA|CURSO|RELAÇÃO|LISTA|EDITAL|PROGRAMA|CRONOGRAMA|PLANO)/i.test(plain) ||
     // Referência institucional em parágrafo
     /\b(da|do|de)\s+(Diretoria|Comando|Assessoria|Corregedoria|Secretaria|Divisão|Seção)\b/i.test(plain)
   );
@@ -714,15 +776,16 @@ export const isGeometricallyAlignedWithTable = (
   // Coleta os X-ranges das colunas das linhas de tabela vizinhas
   const tableXRanges = neighboringTableTokens.map(tok => ({ xLeft: tok.x, xRight: tok.x + tok.w }));
 
-  // Verifica se pelo menos 50% dos tokens da linha atual se sobrepõem com algum range de tabela
+  // Verifica se pelo menos 70% dos tokens da linha atual se sobrepõem com algum range de tabela
   let alignedCount = 0;
   for (const tok of lineTokens) {
+    // Reduzida a tolerância para 10px para evitar sobreposição acidental com parágrafos
     const overlap = tableXRanges.some(r =>
-      tok.x < r.xRight + 20 && tok.x + tok.w > r.xLeft - 20
+      tok.x < r.xRight + 10 && tok.x + tok.w > r.xLeft - 10
     );
     if (overlap) alignedCount++;
   }
-  return alignedCount >= Math.ceil(lineTokens.length * 0.5);
+  return alignedCount >= Math.ceil(lineTokens.length * 0.7);
 };
 
 /**
@@ -737,6 +800,8 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
     const plain = text.replace(/\*\*/g, '').trim();
     if (!plain) return false;
 
+    const wideSpaceMatches = (plain.match(/\s{3,}/g) || []).length;
+
     // ── SINAIS NEGATIVOS FORTES — nunca são tabela ──────────────────────────
     
     // Título centralizado em CAIXA ALTA (ex: "CHOAE/2025 - FICHA DE AVALIAÇÃO DE ESTÁGIO")
@@ -747,45 +812,55 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
     // Padrões de parágrafo legal/narrativo que nunca são tabela,
     // mesmo que contenham gaps geométricos causados por negrito.
     const isDefinitelyParagraph =
-      // Numeração hierárquica de documento (1.1., 1.1.1.)
-      /^\d+\.\d+\.?\s/.test(plain) ||
+      // Título de nota ou edital (ex: "1. CURSO DE...") - Rigoroso: começa com numeração e tem palavras-chave
+    // Se a linha for um cabeçalho legítimo (ex: "1. NOME RG"), isTableHeader já terá sido verificado antes ou será verificado depois.
+    (/^\d+[.\s]+.*(CURSO|RELAÇÃO|EDITAL|NOTA|PROGRAMA|PLANO|INSCRIÇÃO|CONVOCAÇÃO|RESULTADO|GABARITO|ATA|PORTARIA|RESOLUÇÃO|DESPACHO)/i.test(plain) && !/QTD|ORDEM|POSTO|GRAD|NOME|RG|ID\s*FUNC|OBM/i.test(plain.toUpperCase())) ||
+      // Fórmulas de introdução militar
+      /^\b(TORNA\s+PÚBLICA|RESOLVE|DETERMINA|O\s+Cel\s+BM|O\s+Comandante|O\s+Diretor)\b/i.test(plain) ||
+      // Numeração hierárquica de documento (1.1., 1.1.1.) ou diretriz (1), 2))
+      /^\d+([.)]|\.\d+)/.test(plain) ||
+      // Linha começa com letra minúscula (continuação de parágrafo)
+      /^[a-zÀ-ü]/.test(plain) ||
       // Começa com preposição/artigo (continuação de parágrafo)
       /^(e |de |do |da |dos |das |no |na |nos |nas |com |para |pelo |pela |pelos |pelas |ao |aos |às )/i.test(plain) ||
+      // Referência a boletim ou página (FL. 10, BOL. 05)
+      /^(FL\.|BOL\.|PÁG\.|PAG\.)\s*\d+/i.test(plain) ||
       // Contém "por necessidade de serviço"
       /por\s+necessidade\s+de\s+servi[çc]o/i.test(plain) ||
       // Contém SEI (referência de processo)
       /\(SEI[-\s]\d+/.test(plain) ||
-      // Linha de portaria/designação: contém "Portaria" ou "designando" ou "nomeando"
-      /\bPortaria\b/i.test(plain) ||
-      /\bdesignando\b/i.test(plain) ||
-      /\bnomeando\b/i.test(plain) ||
-      /\bpromover\b/i.test(plain) ||
-      /\bagregar\b/i.test(plain) ||
-      // Linha narrativa longa com vírgulas e terminação em ponto (parágrafo típico)
-      (plain.length > 80 && /,$/.test(plain.replace(/\s+$/, '')) === false && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) ||
-      // Contém "da Diretoria" / "do Comando" / "da Assessoria" 
-      // mas APENAS se não tiver múltiplos espaços largos (que indicariam tabela)
-      (/\b(da|do|de)\s+(Diretoria|Comando|Assessoria|Corregedoria|Secretaria|Divisão|Seção)\b/i.test(plain) && (plain.match(/\s{3,}/g) || []).length < 2) ||
-      // Linha de dados de militar: contém RG seguido de número
-      /\bRG\s+\d/.test(plain) ||
-      // Linha com vírgula antes de RG = dado de militar
-      /,\s*RG\b/i.test(plain) ||
-      // Linha de horário: começa com hora (08h, 08:15h, etc.)
-      /^\d{1,2}[h:]\d*/.test(plain.trim()) ||
-      // Linha com "Id Funcional" seguido de número = dado de militar
-      /Id\s*Funcional\s+\d/i.test(plain) ||
-      // Linha que termina em hífen (palavra quebrada) - apenas se for curta (indicativo de quebra)
-      /-$/.test(plain) && plain.length < 50;
+      // Linha de portaria/designação narrativa longa que termina em ponto
+      (plain.length > 80 && /,$/.test(plain.replace(/\s+$/, '')) === false && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 3) ||
+      // Linha que termina em hífen (palavra quebrada) - apenas se for curta
+      (/-$/.test(plain) && plain.length < 50);
 
     if (isDefinitelyParagraph) return false;
 
     // ── ANÁLISE GEOMÉTRICA (quando tokens disponíveis) ──────────────────────
     if (tokens && tokens.length > 1) {
+        // DATA GRID SIGNATURE: Se a linha tem 4+ tokens e eles cobrem mais de 50% da largura da página
+        // (tipicamente entre X=50 e X=500), é muito provavelmente uma linha de tabela.
+        const sorted = [...tokens].sort((a, b) => a.x - b.x);
+        const minX = sorted[0].x;
+        const maxX = sorted[sorted.length - 1].x + sorted[sorted.length - 1].w;
+        const span = maxX - minX;
+        
+        // Padrão de Cabeçalho Denso (COESCI/COER): Muitas palavras curtas alinhadas horizontalmente
+        // Se a linha contém âncoras militares E tem múltiplos tokens, forçamos a detecção como tabela.
+        if (tokens.length >= 3 && /QTD|ORDEM|POSTO|GRAD|NOME|RG|ID\s*FUNC|OBM/i.test(plain.toUpperCase())) {
+          return true;
+        }
+
+        if (tokens.length >= 4 && span > 300 && plain.length < 250) {
+          // Verifica se os tokens não estão todos "amontoados" num parágrafo curto
+          const avgDist = span / tokens.length;
+          if (avgDist > 25) return true;
+        }
+
         // Usa a Assinatura de Layout para decidir se é uma estrutura rítmica (tabela)
         const signature = detectLayoutSignature(tokens);
         if (signature.isRhythmic && signature.verticalAxes.length >= 3) return true;
 
-        const sorted = [...tokens].sort((a, b) => a.x - b.x);
         const gaps: number[] = [];
         
         for (let i = 1; i < sorted.length; i++) {
@@ -821,7 +896,6 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
     }
 
     // ── FALLBACK TEXTUAL ────────────────────────────────────────────────────
-    const wideSpaceMatches = (plain.match(/\s{3,}/g) || []).length;
     const hasTableArtifacts = /[|│║]/.test(plain);
     const looksLikeSentence = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇa-záéíóúâêîôûãõç]/.test(plain) && /[.;:!]$/.test(plain);
     
@@ -856,39 +930,73 @@ export const isTableHeader = (text: string): boolean => {
   if (!clean) return false;
 
   const plain = text.replace(/\*\*/g, '').trim();
+  const up = plain.toUpperCase();
 
-  // ── REJEIÇÕES IMEDIATAS ──────────────────────────────────────────────────
+  // ── REGRA DE OURO (FORÇADA) ─────────────────────────────────────────────
+  // Se contiver QTD/ORDEM e qualquer outra palavra de tabela no mesmo bloco, É cabeçalho.
+  const anchors = ["QTD", "ORDEM", "NOME", "POSTO", "GRAD", "RG", "ID", "OBM", "FUNCIONAL", "INSCRIÇÃO", "INSC", "RELAÇÃO", "INSCRITOS", "PÁG", "PAG", "MATRÍCULA", "IDENTIDADE", "CLASSIFICAÇÃO", "QUADRO", "CPF", "Nº", "N°"];
+  const upMatch = anchors.filter(a => up.includes(a));
+  
+  // Detecção de Grade Militar Típica (QTD POSTO/GRAD. NOME RG ID FUNCIONAL OBM)
+  // Se houver 4+ âncoras na mesma linha, é 100% de certeza que é cabeçalho.
+  if (upMatch.length >= 4) return true;
 
-  if (/;\s*$/.test(plain)) return false;
-  if (/\(SEI[-\s]\d+/.test(plain)) return false;
-  if (/por\s+necessidade\s+de\s+servi[çc]o/i.test(plain)) return false;
-  // Sub-título numerado (ex: "3. MILITARES CAPACITADOS:", "1. VIATURA:")
-  if (/^\d+[\s.]+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ].*:$/.test(plain.toUpperCase())) return false;
-  if (plain.length > 80 && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) return false;
-  if (/^(e |de |do |da |dos |das |no |na |nos |nas |com |para |pelo |pela )/i.test(plain)) return false;
-  // RG seguido de número = dado de militar (ex: "RG 43.544")
-  if (/\bRG\s+\d/.test(plain)) return false;
-  // Linha começa com horário = dado de agenda/escala (ex: "08h    ABERTURA")
-  if (/^\d{1,2}[h:]\d*/.test(plain.trim())) return false;
-  // Vírgula antes de RG = dado de militar
-  if (/,\s*RG\b/i.test(plain)) return false;
-  // Id Funcional com número = dado de militar
-  if (/Id\s*Funcional\s+\d/i.test(plain)) return false;
+  // Caso 1: QTD/ORDEM + 1 âncora = cabeçalho quase certo
+  if ((up.includes("QTD") || up.includes("ORDEM")) && upMatch.length >= 2) {
+    return true;
+  }
 
-  // ── PADRÕES COMPOSTOS COM BARRA — evidência forte de cabeçalho ──────────
-  const compositeHeaderPatterns = [
-    /\bPOSTO\s*\/\s*GRAD/,
-    /\bGRAD\s*\/\s*ANO/,
-    /\bN[°º]\s*\/\s*RG/,
-    /\bRG\s*\/\s*ID/,
-    /\bOBM\s*\/\s*DBM/,
-    /\bNOME\s*\/\s*GUERRA/,
-    /\bID\s*\/\s*FUNCIONAL/,
-    /\bCLASSIF\s*\/\s*QUADRO/,
-    /\bPOSTO\s*\/\s*NOME/,
-    /\bMILITAR\s*\/\s*OBM/,
-  ];
-  if (compositeHeaderPatterns.some(p => p.test(clean))) return true;
+  // Caso 2: Pelo menos 3 âncoras (ex: "NOME RG ID FUNCIONAL")
+  if (upMatch.length >= 3 && plain.length < 150) {
+    return true;
+  }
+
+  // Caso 3: Padrões de cabeçalho de grade militar muito curtos com espaços largos ou tabulações
+  if (upMatch.length >= 2 && (plain.match(/\s{2,}/g) || []).length >= 1 && plain.length < 80) {
+    return true;
+  }
+
+   // Caso 4: Palavras de cabeçalho puro isoladas (ex: "MILITAR", "RELACIONADOS")
+   // SINGLE_COL_LIST_RE — fonte única em tableTypes.ts
+   if (SINGLE_COL_LIST_RE.test(clean.trim())) return true;
+
+   // ── REJEIÇÕES IMEDIATAS ──────────────────────────────────────────────────
+
+   if (/;\s*$/.test(plain)) return false;
+   if (/\(SEI[-\s]\d+/.test(plain)) return false;
+   if (/por\s+necessidade\s+de\s+servi[çc]o/i.test(plain)) return false;
+   // Sub-título numerado (ex: "3. MILITARES CAPACITADOS:", "1) VIATURA:")
+   if (/^\d+[\s.)]+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ].*:$/.test(plain.toUpperCase())) return false;
+   // Subtítulo interno de documento: "1. DATA, HORA E LOCAL", "2) REFERÊNCIAS", "3. UNIFORME"
+   // Se chegou aqui, as "Regras de Ouro" não o identificaram como cabeçalho.
+   if (/^\d+[\s.)]+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]/.test(plain)) return false;
+   if (plain.length > 80 && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) return false;
+   if (/^(e |de |do |da |dos |das |no |na |nos |nas |com |para |pelo |pela )/i.test(plain)) return false;
+   // Campo de formulário: "Palavra:" ou "Palavra: valor" — nunca é cabeçalho
+   if (/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç\s]+:/.test(plain)) return false;
+   // RG seguido de número = dado de militar (ex: "RG 43.544")
+   if (/\bRG\s+\d/.test(plain)) return false;
+   // Linha começa com horário = dado de agenda/escala (ex: "08h    ABERTURA")
+   if (/^\d{1,2}[h:]\d*/.test(plain.trim())) return false;
+   // Vírgula antes de RG = dado de militar
+   if (/,\s*RG\b/i.test(plain)) return false;
+   // Id Funcional com número = dado de militar
+   if (/Id\s*Funcional\s+\d/i.test(plain)) return false;
+
+   // ── PADRÕES COMPOSTOS COM BARRA — evidência forte de cabeçalho ──────────
+   const compositeHeaderPatterns = [
+     /\bPOSTO\s*\/\s*GRAD/,
+     /\bGRAD\s*\/\s*ANO/,
+     /\bN[°º]\s*\/\s*RG/,
+     /\bRG\s*\/\s*ID/,
+     /\bOBM\s*\/\s*DBM/,
+     /\bNOME\s*\/\s*GUERRA/,
+     /\bID\s*\/\s*FUNCIONAL/,
+     /\bCLASSIF\s*\/\s*QUADRO/,
+     /\bPOSTO\s*\/\s*NOME/,
+     /\bMILITAR\s*\/\s*OBM/,
+   ];
+   if (compositeHeaderPatterns.some(p => p.test(clean))) return true;
 
   // Nº/N° seguido de número (com espaço) = dado, não cabeçalho (ex: "Nº 02 CARLOS SILVA")
   const hasNrWithValue = /\bN[°º]\s{0,3}\d/.test(plain);
@@ -908,8 +1016,8 @@ export const isTableHeader = (text: string): boolean => {
   // Só contam se a linha não parece ser dado e é curta.
   // Palavras precedidas de ordinal (ex: "5º GBM", "1º OBM") = nome de unidade → não contam.
   const contextualKeywords = [
-    'NOME', 'POSTO', 'OBM', 'DBM', 'GBM', 'UNIDADE', 'GRAD',
-    'MILITAR', 'MILITARES', 'INSTRUTOR', 'INSTRUTORES', 'ALUNO', 'ALUNOS',
+    'NOME', 'POSTO', 'OBM', 'DBM', 'GBM', 'UNIDADE', 'GRAD', 'QTD', 'ORDEM', 'INSCRIÇÃO', 'INSC',
+    'MILITAR', 'MILITARES', 'INSTRUTOR', 'INSTRUTORES', 'ALUNO', 'ALUNOS', 'INSCRITOS', 'RELAÇÃO',
     'HORÁRIO', 'PERÍODO', 'DATA', 'LOCAL', 'TEMA', 'TURMA', 'VALOR', 'RESULTADO',
   ];
 

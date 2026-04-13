@@ -11,7 +11,15 @@ export function useSavedNotas() {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setSavedNotas(JSON.parse(raw));
+      if (raw) {
+        const parsed = JSON.parse(raw) as SavedNota[];
+        // Migração: Se a nota não tiver categoria, assume 'error' (conforme uso atual relatado pelo usuário)
+        const migrated = parsed.map(n => ({
+          ...n,
+          category: n.category || 'error'
+        }));
+        setSavedNotas(migrated);
+      }
     } catch { /* ignore */ }
   }, []);
 
@@ -20,10 +28,15 @@ export function useSavedNotas() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(notas));
   };
 
-  const saveNota = (nota: BulletinNota, bulletinFilename: string) => {
-    // Evita duplicatas do mesmo nota+boletim
+  const saveNota = (
+    nota: BulletinNota, 
+    bulletinFilename: string, 
+    category: 'error' | 'relevant' = 'relevant',
+    diagnosticData?: SavedNota['diagnosticData']
+  ) => {
+    // Evita duplicatas do mesmo nota+boletim na mesma categoria
     const alreadySaved = savedNotas.some(
-      s => s.notaId === nota.id && s.bulletinFilename === bulletinFilename
+      s => s.notaId === nota.id && s.bulletinFilename === bulletinFilename && s.category === category
     );
     if (alreadySaved) return false;
 
@@ -33,7 +46,10 @@ export function useSavedNotas() {
       notaTitle: nota.title,
       notaContent: nota.contentMarkdown,
       bulletinFilename,
+      category,
+      isTableRow: !!(nota as any).isTableRow,
       savedAt: new Date().toLocaleString('pt-BR'),
+      diagnosticData,
     };
     persist([entry, ...savedNotas]);
     return true;
@@ -47,8 +63,23 @@ export function useSavedNotas() {
     persist(savedNotas.map(s => s.id === id ? { ...s, observation } : s));
   };
 
-  const isSaved = (notaId: string, bulletinFilename: string) =>
-    savedNotas.some(s => s.notaId === notaId && s.bulletinFilename === bulletinFilename);
+  const isSaved = (notaId: string, bulletinFilename: string, category?: 'error' | 'relevant') =>
+    savedNotas.some(s => 
+      s.notaId === notaId && 
+      s.bulletinFilename === bulletinFilename && 
+      (category ? s.category === category : true)
+    );
 
-  return { savedNotas, saveNota, removeNota, updateObservation, isSaved };
+  const importNotas = (imported: SavedNota[]) => {
+    // Mescla as notas importadas com as atuais, evitando duplicatas por ID
+    const currentIds = new Set(savedNotas.map(n => n.id));
+    const newItems = imported.filter(n => !currentIds.has(n.id));
+    if (newItems.length > 0) {
+      persist([...newItems, ...savedNotas]);
+      return newItems.length;
+    }
+    return 0;
+  };
+
+  return { savedNotas, saveNota, removeNota, updateObservation, isSaved, importNotas };
 }

@@ -4,6 +4,7 @@ import { BookOpen, ChevronRight, Copy, Check, FileText, Download, Table, ArrowLe
 import SumarioView from './SumarioView';
 import * as XLSX from 'xlsx';
 import { normalizeTitle } from '../services/textUtils';
+import { splitFormFieldLines, hasMultipleFormFields, isFormFieldLine } from '../core/text/formFieldSplitter';
 import { buildNotaTree, ParteNode, EixoNode, SubNode, EixoSlot, ParteSlot } from '../services/notaTreeService';
 import { matchPersonnelInLine } from '../services/localSearchService';
 
@@ -260,9 +261,27 @@ const renderParagraphs = (
   searchPrefs?: SearchPreferences,
   onFilteredRowsChange?: (tableIdx: number, rows: TableData['rows']) => void
 ) => {
+  // CORREÇÃO #2D: Pré-processamento para quebrar linhas com múltiplos campos de formulário
+  // Usa formFieldSplitter — fonte única de verdade para esta lógica
+  let processedText = text;
+  const lines = text.split('\n');
+  const newLines: string[] = [];
+  
+  for (const line of lines) {
+    if (hasMultipleFormFields(line)) {
+      // splitFormFieldLines já retorna as linhas quebradas com indentação
+      const split = splitFormFieldLines([line]);
+      newLines.push(...split);
+    } else {
+      newLines.push(line);
+    }
+  }
+  
+  processedText = newLines.join('\n');
+  
   // Compatibilidade com boletins antigos: converte <p align="center">...</p> para [CENTER]
-  const normalizedText = text.replace(/<p\s+align="center">([\s\S]*?)<\/p>/gi, '[CENTER]$1');
-  const lines = normalizedText.split('\n');
+  const normalizedText = processedText.replace(/<p\s+align="center">([\s\S]*?)<\/p>/gi, '[CENTER]$1');
+  const processedLines = normalizedText.split('\n');
   
   const elements: React.ReactNode[] = [];
   let paragraphBuffer: string[] = [];
@@ -319,8 +338,8 @@ const renderParagraphs = (
     );
   };
   
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+  for (let i = 0; i < processedLines.length; i++) {
+    const line = processedLines[i];
     const trimmed = line.trim();
     
     if (trimmed.startsWith('```grid')) {
@@ -411,7 +430,10 @@ const renderParagraphs = (
       const isHeaderLine = /^\s*\*{1,3}.*\*{1,3}\s*$/.test(cleanTrimmed);
       const isListItem = /^\s*(\d+|[a-z]|[IVX]+)[\s\.\)\-]/.test(cleanTrimmed);
       
-      if (isHeaderLine || isListItem) {
+      // Usa isFormFieldLine — fonte única de verdade para detecção de campos de formulário
+      const isFormDataLine = isFormFieldLine(cleanTrimmed);
+      
+      if (isHeaderLine || isListItem || isFormDataLine) {
         flushParagraph(i);
         let lineHtml = cleanTrimmed
           .replace(/&/g, '&amp;')
@@ -426,15 +448,20 @@ const renderParagraphs = (
         let isCentered = false;
         if (trimmed.includes('[CENTER]')) isCentered = true;
 
+        // Linhas de dados de formulário: sem indent, alinhamento à esquerda
+        const textAlign = isFormDataLine ? 'left' : (isCentered ? 'center' : 'justify');
+        const indent = isFormDataLine ? '0' : (isCentered ? '0' : '2rem');
+
         elements.push(
           <p 
             key={`h-${i}`}
-            className={`leading-relaxed mb-1 text-gray-900 ${isHeaderLine ? 'font-semibold' : ''} ${isCentered ? 'text-center' : 'indent-8'}`}
+            className={`leading-relaxed mb-1 text-gray-900 ${isHeaderLine ? 'font-semibold' : ''}`}
             style={{ 
               fontFamily: "'Segoe UI', system-ui, sans-serif",
               fontSize: '12px',
               lineHeight: 1.6,
-              textAlign: isCentered ? 'center' : 'justify',
+              textAlign: textAlign as any,
+              textIndent: indent,
             }}
             dangerouslySetInnerHTML={{ __html: lineHtml }}
           />
@@ -673,8 +700,17 @@ const NotasView: React.FC<NotasViewProps> = ({
   }
 
   const handleCopy = async (nota: BulletinNota) => {
+    // Pré-processamento: quebra linhas com campos de formulário (usa formFieldSplitter)
+    const preprocessMarkdown = (md: string): string => {
+      return md.split('\n').flatMap(line =>
+        hasMultipleFormFields(line) ? splitFormFieldLines([line]) : [line]
+      ).join('\n');
+    };
+
+    const preprocessed = preprocessMarkdown(nota.contentMarkdown);
+
     // 1. Texto Plano (para blocos de notas simples)
-    const cleanTextPlain = nota.contentMarkdown
+    const cleanTextPlain = preprocessed
       .replace(/```grid(-tab-\d+)?\n/g, '')
       .replace(/\n```/g, '')
       .replace(/ \| /g, '\t')
@@ -682,7 +718,7 @@ const NotasView: React.FC<NotasViewProps> = ({
     const fullTextPlain = `${nota.title}\n\n${cleanTextPlain}`;
 
     // 2. HTML (para Word/LibreOffice manter negrito e justificação)
-    let bodyHtml = nota.contentMarkdown
+    let bodyHtml = preprocessed
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -710,11 +746,22 @@ const NotasView: React.FC<NotasViewProps> = ({
             rows.map(r => `<tr>${r.split(' | ').map(c => `<td style="padding:4px;border:1px solid black;">${c}</td>`).join('')}</tr>`).join('')
           }</table><div style="text-align:justify;line-height:1.15;margin-bottom:6pt;color:black;">`;
       })
+      .split('\n')
+      .map(line => {
+        const plainLine = line.replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, ' ').trim();
+        const isFormLine = /^(<b>|<i>|<strong>)?[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][A-Za-záéíóúâêîôûãõç\s]{0,30}:/.test(plainLine);
+        const isListItem = /^\d+[\d.]*\.?\s/.test(plainLine) || /^[a-z]\)\s/.test(plainLine) || /^-\s/.test(plainLine);
+        if (isFormLine || isListItem) {
+          return `<div style="text-align:left;line-height:1.5;margin-bottom:2pt;text-indent:0;color:black;">${line}</div>`;
+        }
+        return line;
+      })
+      .join('\n')
       .split('\n\n')
       .map(p => p.trim())
       .filter(p => p.length > 0)
       .map(p => {
-        // Itens de lista hierárquica (1.1., 1.1.1., 1. TRANSFERIR, etc.) — sem indent
+        if (p.startsWith('<div')) return p; // já processado
         const isListItem = /^\d+[\d.]*\.?\s/.test(p) || /^[a-z]\)\s/.test(p);
         const indent = isListItem ? '0' : '1cm';
         return `<div style="text-align:justify;line-height:1.15;margin-bottom:6pt;text-indent:${indent};color:black;">${p}</div>`;
@@ -902,6 +949,22 @@ const NotasView: React.FC<NotasViewProps> = ({
         </div>
         {isExpanded && (
           <div className="px-6 py-5 bg-white animate-in slide-in-from-top-2 duration-300">
+            {nota.matchedEntities && nota.matchedEntities.length > 0 && (
+              <div className="mb-4 flex flex-wrap gap-2 items-center">
+                <span className="text-[10px] font-black text-amber-700 uppercase tracking-widest">
+                  Militar{nota.matchedEntities.length > 1 ? 'es' : ''} do efetivo:
+                </span>
+                {nota.matchedEntities.map((name, idx) => (
+                  <span
+                    key={idx}
+                    className="inline-flex items-center gap-1 bg-amber-50 border border-amber-300 text-amber-800 text-[11px] font-bold px-2.5 py-0.5 rounded-full"
+                  >
+                    <Star className="w-2.5 h-2.5 fill-amber-500 text-amber-500" />
+                    {name}
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="flex gap-4">
               <div className="w-1 rounded-full flex-shrink-0 bg-indigo-50 mt-1" />
               <div className="flex-1 min-w-0">
@@ -971,7 +1034,7 @@ const NotasView: React.FC<NotasViewProps> = ({
               <div className="pl-4 md:pl-10 space-y-4 animate-in slide-in-from-top-4 duration-300">
                 {/* Sumário direto, sem dropdown */}
                 {sumarioNotas.map(nota => (
-                  <div key={nota.id} className="mb-2"><SumarioView nota={nota} onNavigate={onNavigate} onViewPage={onViewPage} /></div>
+                  <div key={nota.id} className="mb-2"><SumarioView nota={nota} notas={notas} onNavigate={onNavigate} onViewPage={onViewPage} /></div>
                 ))}
 
                 {/* Abertura do Boletim como dropdown colapsado */}
@@ -1006,11 +1069,12 @@ const NotasView: React.FC<NotasViewProps> = ({
       {Array.from(hierarchyTree.parteMap.values()).map(parteNode => {
         const isParteExpanded = expandedGroups.has(parteNode.id);
         const totalNotas = groupedNotas.find(g => g.id === parteNode.id)?.items.length ?? 0;
+        const relevantInParte = groupedNotas.find(g => g.id === parteNode.id)?.items.filter(n => n.isRelevant).length ?? 0;
 
         return (
           <div key={parteNode.id} className="space-y-3">
             <div
-              className={`rounded-xl border-2 transition-all cursor-pointer overflow-hidden ${isParteExpanded ? 'border-indigo-100 bg-indigo-50/20' : 'border-gray-200 bg-white hover:border-indigo-200'}`}
+              className={`rounded-xl border-2 transition-all cursor-pointer overflow-hidden ${isParteExpanded ? 'border-indigo-100 bg-indigo-50/20' : relevantInParte > 0 ? 'border-amber-300 bg-amber-50/30 hover:border-amber-400' : 'border-gray-200 bg-white hover:border-indigo-200'}`}
               onClick={() => toggleGroup(parteNode.id)}
             >
               <div className="px-6 py-4 flex items-center justify-between group">
@@ -1020,9 +1084,16 @@ const NotasView: React.FC<NotasViewProps> = ({
                   </div>
                   <h3 className={`text-sm font-black uppercase tracking-widest ${isParteExpanded ? 'text-indigo-900' : 'text-gray-600'}`}>{parteNode.title}</h3>
                 </div>
-                <span className="text-[10px] font-bold bg-white/80 border border-gray-200 px-2 py-1 rounded shadow-sm">
-                  {totalNotas} {totalNotas === 1 ? 'Nota' : 'Notas'}
-                </span>
+                <div className="flex items-center gap-2">
+                  {relevantInParte > 0 && (
+                    <span className="text-[10px] font-black bg-amber-400 text-amber-900 px-2 py-1 rounded shadow-sm flex items-center gap-1">
+                      <Star className="w-3 h-3 fill-amber-900" /> {relevantInParte}
+                    </span>
+                  )}
+                  <span className="text-[10px] font-bold bg-white/80 border border-gray-200 px-2 py-1 rounded shadow-sm">
+                    {totalNotas} {totalNotas === 1 ? 'Nota' : 'Notas'}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -1039,11 +1110,13 @@ const NotasView: React.FC<NotasViewProps> = ({
                   const isEixoExpanded = expandedGroups.has(eixoNode.id);
                   const eixoTotal = eixoNode.slots.reduce((acc, es) =>
                     acc + (es.kind === 'nota' ? 1 : es.sub.notas.length), 0);
+                  const eixoRelevant = eixoNode.slots.reduce((acc, es) =>
+                    acc + (es.kind === 'nota' ? (es.nota.isRelevant ? 1 : 0) : es.sub.notas.filter(n => n.isRelevant).length), 0);
 
                   return (
                     <div key={eixoNode.id} className="space-y-3">
                       <div
-                        className={`rounded-lg border transition-all cursor-pointer overflow-hidden ${isEixoExpanded ? 'border-indigo-200 bg-indigo-50/30' : 'border-gray-200 bg-gray-50 hover:border-indigo-200'}`}
+                        className={`rounded-lg border transition-all cursor-pointer overflow-hidden ${isEixoExpanded ? 'border-indigo-200 bg-indigo-50/30' : eixoRelevant > 0 ? 'border-amber-300 bg-amber-50/20 hover:border-amber-400' : 'border-gray-200 bg-gray-50 hover:border-indigo-200'}`}
                         onClick={() => toggleGroup(eixoNode.id)}
                       >
                         <div className="px-5 py-3 flex items-center justify-between group">
@@ -1051,7 +1124,14 @@ const NotasView: React.FC<NotasViewProps> = ({
                             <ChevronRight className={`w-4 h-4 text-indigo-400 transition-transform duration-300 ${isEixoExpanded ? 'rotate-90' : ''}`} />
                             <h4 className={`text-xs font-black uppercase tracking-wider ${isEixoExpanded ? 'text-indigo-800' : 'text-gray-500'}`}>{eixoNode.title}</h4>
                           </div>
-                          <span className="text-[9px] font-bold text-gray-400">{eixoTotal} {eixoTotal === 1 ? 'nota' : 'notas'}</span>
+                          <div className="flex items-center gap-2">
+                            {eixoRelevant > 0 && (
+                              <span className="text-[9px] font-black bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded flex items-center gap-1">
+                                <Star className="w-2.5 h-2.5 fill-amber-900" /> {eixoRelevant}
+                              </span>
+                            )}
+                            <span className="text-[9px] font-bold text-gray-400">{eixoTotal} {eixoTotal === 1 ? 'nota' : 'notas'}</span>
+                          </div>
                         </div>
                       </div>
 
@@ -1065,10 +1145,11 @@ const NotasView: React.FC<NotasViewProps> = ({
 
                             const subNode = es.sub;
                             const isSubExpanded = expandedGroups.has(subNode.id);
+                            const subRelevant = subNode.notas.filter(n => n.isRelevant).length;
                             return (
                               <div key={subNode.id} className="space-y-2">
                                 <div
-                                  className={`rounded-lg border transition-all cursor-pointer overflow-hidden ${isSubExpanded ? 'border-indigo-200 bg-indigo-50/30' : 'border-gray-200 bg-gray-50 hover:border-indigo-200'}`}
+                                  className={`rounded-lg border transition-all cursor-pointer overflow-hidden ${isSubExpanded ? 'border-indigo-200 bg-indigo-50/30' : subRelevant > 0 ? 'border-amber-300 bg-amber-50/20 hover:border-amber-400' : 'border-gray-200 bg-gray-50 hover:border-indigo-200'}`}
                                   onClick={() => toggleGroup(subNode.id)}
                                 >
                                   <div className="px-5 py-3 flex items-center justify-between group">
@@ -1076,7 +1157,14 @@ const NotasView: React.FC<NotasViewProps> = ({
                                       <ChevronRight className={`w-4 h-4 text-indigo-400 transition-transform duration-300 ${isSubExpanded ? 'rotate-90' : ''}`} />
                                       <h5 className={`text-xs font-black uppercase tracking-wider ${isSubExpanded ? 'text-indigo-800' : 'text-gray-500'}`}>{subNode.title}</h5>
                                     </div>
-                                    <span className="text-[9px] font-bold text-gray-400">{subNode.notas.length} {subNode.notas.length === 1 ? 'nota' : 'notas'}</span>
+                                    <div className="flex items-center gap-2">
+                                      {subRelevant > 0 && (
+                                        <span className="text-[9px] font-black bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded flex items-center gap-1">
+                                          <Star className="w-2.5 h-2.5 fill-amber-900" /> {subRelevant}
+                                        </span>
+                                      )}
+                                      <span className="text-[9px] font-bold text-gray-400">{subNode.notas.length} {subNode.notas.length === 1 ? 'nota' : 'notas'}</span>
+                                    </div>
                                   </div>
                                 </div>
                                 {isSubExpanded && (

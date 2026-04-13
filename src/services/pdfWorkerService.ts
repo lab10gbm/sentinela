@@ -17,6 +17,7 @@ if (typeof (Promise as any).withResolvers === 'undefined') {
 
 import { TextToken } from "../types";
 import { calibrationService } from "./calibrationService";
+import { splitFormFieldLines } from "../core/text/formFieldSplitter";
 
 /**
  * Função auxiliar para rodar OCR em uma página específica via Tesseract.js
@@ -141,7 +142,7 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
       );
 
       tokens = textContent.items
-        .map((item: any) => {
+        .flatMap((item: any) => {
           const transform = item.transform;
           const style = (textContent.styles as any)[item.fontName] || {};
           const fontFamily = (style.fontFamily || "").toLowerCase();
@@ -161,7 +162,7 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
           const isBoldByCommon = fromCommon?.isBold ?? false;
           const isItalicByCommon = fromCommon?.isItalic ?? false;
 
-          return {
+          const baseToken = {
             text: item.str,
             x: transform[4],
             y: transform[5],
@@ -173,11 +174,37 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
             fontSize: transform[0],
             fontName: item.fontName, // Preserva para análise estatística
           };
+
+          // SEPARADOR DE TOKENS FUNDIDOS: 
+          // Se a string contém múltiplos espaços (3 ou mais), quebra em tokens separados.
+          // Isso resolve PDFs onde QTD e POSTO vêm na mesma string item.str.
+          if (item.str.includes("   ")) {
+            const parts = item.str.split(/(\s{3,})/g);
+            const subTokens: any[] = [];
+            let currentX = baseToken.x;
+            const charWidth = baseToken.w / item.str.length;
+
+            for (const part of parts) {
+              if (part.trim().length > 0) {
+                subTokens.push({
+                  ...baseToken,
+                  text: part.trim(),
+                  x: currentX,
+                  w: part.length * charWidth
+                });
+              }
+              currentX += part.length * charWidth;
+            }
+            return subTokens;
+          }
+
+          return [baseToken];
         })
         .filter((t: any) => t.text.trim().length > 0);
 
       // Fallback 3: Análise híbrida (frequência + densidade)
       // Fontes bold aparecem menos vezes (títulos) e têm maior densidade (traços grossos)
+      // CORREÇÃO #3: Thresholds mais sensíveis para capturar títulos curtos
       const fontStats = new Map<string, { count: number; densitySum: number; densityCount: number }>();
       tokens.forEach((t: any) => {
         if (!t.isBold && t.text.trim().length > 0 && t.fontSize > 0) {
@@ -205,30 +232,37 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
         // Ordena por densidade (maior = mais provável de ser bold)
         fontAnalysis.sort((a, b) => b.avgDensity - a.avgDensity);
 
-        // Critério híbrido: fonte é bold se:
-        // 1. Frequência < 40% (aparece menos que o corpo de texto) E
-        // 2. Densidade > 1.2x a fonte mais leve E
-        // 3. Pelo menos 10 amostras
-        const lightestDensity = fontAnalysis[fontAnalysis.length - 1].avgDensity;
-        const densityThreshold = lightestDensity * 1.2;
-        const frequencyThreshold = calibrationService.settings.boldContrastThreshold; // 0.4 padrão
+        // Critério híbrido:
+        // 1. Frequência < 30%
+        // 2. Densidade > 1.15x a fonte de referência (a mais leve com amostras suficientes)
+        //    Usa a fonte mais leve com ≥ 5 amostras como referência, ignorando fontes de símbolo
+        //    com poucas amostras que distorcem o mínimo.
+        // 3. Pelo menos 5 amostras
+        const frequencyThreshold = Math.min(calibrationService.settings.boldContrastThreshold, 0.30);
+        const referenceFonts = fontAnalysis.filter(f => f.count >= 5);
+        if (referenceFonts.length === 0) {
+          // sem fontes com amostras suficientes — não aplica análise híbrida nesta página
+        } else {
+          const lightestDensity = referenceFonts[referenceFonts.length - 1].avgDensity;
+          const densityThreshold = lightestDensity * 1.15;
 
-        const boldFonts = new Set(
-          fontAnalysis
-            .filter(f => 
-              f.frequency < frequencyThreshold && 
-              f.avgDensity > densityThreshold && 
-              f.count >= 10
-            )
-            .slice(0, 2) // Máximo 2 fontes bold
-            .map(f => f.fontName)
-        );
+          const boldFonts = new Set(
+            fontAnalysis
+              .filter(f => 
+                f.frequency < frequencyThreshold && 
+                f.avgDensity > densityThreshold && 
+                f.count >= 5
+              )
+              .slice(0, 2) // Máximo 2 fontes bold
+              .map(f => f.fontName)
+          );
 
-        if (boldFonts.size > 0) {
-          tokens.forEach((t: any) => {
-            if (!t.isBold && boldFonts.has(t.fontName)) t.isBold = true;
-          });
-          console.log(`[Sentinela] Detecção de bold via análise híbrida: ${boldFonts.size} fontes (freq<${frequencyThreshold}, density>${densityThreshold.toFixed(3)})`);
+          if (boldFonts.size > 0) {
+            tokens.forEach((t: any) => {
+              if (!t.isBold && boldFonts.has(t.fontName)) t.isBold = true;
+            });
+            console.log(`[Sentinela] Detecção de bold via análise híbrida: ${boldFonts.size} fontes (freq<${frequencyThreshold.toFixed(2)}, density>${densityThreshold.toFixed(3)})`);
+          }
         }
       }
 
@@ -285,25 +319,63 @@ export const extractTextFromPdf = async (file: File, onOcrProgress?: (page: numb
         });
 
         // Renderiza runs com marcadores de formatação
-        const lineText = runs.map(r => {
-          let s = r.text;
-          if (r.isBold && r.isItalic) return `***${s.trim()}***`;
-          if (r.isBold) return `**${s.trim()}**`;
-          if (r.isItalic) return `*${s.trim()}*`;
-          return s;
+        // CORREÇÃO: garante espaço entre runs de estilos diferentes quando o spacer estava no início do run seguinte
+        const lineText = runs.map((r, ri) => {
+          // O spacer está embutido no início do texto do run (ex: " AURELIO")
+          // Precisamos extraí-lo para colocá-lo FORA dos marcadores de bold/italic
+          const leadingSpace = r.text.match(/^(\s+)/)?.[1] ?? "";
+          let s = r.text.trimStart();
+          if (r.isBold && r.isItalic) return `${leadingSpace}***${s.trim()}***`;
+          if (r.isBold) return `${leadingSpace}**${s.trim()}**`;
+          if (r.isItalic) return `${leadingSpace}*${s.trim()}*`;
+          return r.text; // texto normal: preserva espaço original
         }).join("");
 
         sortedLines.push({ text: lineText, y: yKey });
       });
 
-    const pageText = sortedLines.map(l => l.text).join("\n");
-    fullText += `\n--- [INÍCIO DA PÁGINA ${i}${isOcrDerived ? ' (OCR)' : ''}] ---\n` + pageText + `\n--- [FIM DA PÁGINA ${i}] ---\n`;
+    // CORREÇÃO #2F: Quebra de linhas com múltiplos campos de formulário
+    // Detecta padrões como "Data:...; Horário:...; Local:..." e quebra em linhas separadas
+    // Usa formFieldSplitter — fonte única de verdade para esta lógica
+    const rawLineTexts = sortedLines.map(l => l.text);
+    const splitTexts = splitFormFieldLines(rawLineTexts);
+
+    // Reconstrói o array de linhas com Y incremental para linhas quebradas
+    const processedLines: { text: string; y: number }[] = [];
+    let sortedIdx = 0;
+    let splitIdx = 0;
+    while (splitIdx < splitTexts.length) {
+      const originalLine = sortedLines[sortedIdx];
+      const splitText = splitTexts[splitIdx];
+      processedLines.push({ text: splitText, y: originalLine.y + (splitIdx - sortedIdx) * 0.1 });
+      splitIdx++;
+      // Avança para a próxima linha original quando o texto não pertence mais à atual
+      if (splitIdx < splitTexts.length) {
+        const nextOriginal = sortedLines[sortedIdx + 1];
+        if (nextOriginal && splitTexts[splitIdx] === nextOriginal.text) {
+          sortedIdx++;
+        } else if (!splitTexts[splitIdx].startsWith('    ')) {
+          sortedIdx++;
+        }
+      }
+    }
+
+    const pageText = processedLines.map(l => l.text).join("\n");
+    
+    // CORREÇÃO #6: Extração de imagens embutidas - DESABILITADA temporariamente
+    // Causa: "Requesting object that isn't resolved yet" - imagens não estão prontas
+    // TODO: Implementar com await page.objs.ensure() ou renderização de página completa
+    let imageMarkdown = "";
+    // Desabilitado até resolver o problema de sincronização
+    
+    const pageTextWithImages = pageText + imageMarkdown;
+    fullText += `\n--- [INÍCIO DA PÁGINA ${i}${isOcrDerived ? ' (OCR)' : ''}] ---\n` + pageTextWithImages + `\n--- [FIM DA PÁGINA ${i}] ---\n`;
     
     pageMap.push({
       page: i,
-      text: pageText,
+      text: pageTextWithImages,
       tokens,
-      lines: sortedLines,
+      lines: processedLines, // Usa processedLines em vez de sortedLines
       isOcr: isOcrDerived
     });
   }

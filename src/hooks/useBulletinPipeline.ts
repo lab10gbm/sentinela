@@ -6,7 +6,13 @@ import { extractTextFromPdf } from '../services/pdfWorkerService';
 import { extractBulletinLocalAlgo } from '../services/bulletinParserService';
 import { saveBulletin, getAllBulletins, deleteBulletinFromDB } from '../services/dbService';
 
-type PageMapEntry = { page: number; text: string; tokens: TextToken[]; lines: { text: string; y: number }[] };
+type PageMapEntry = { 
+  page: number; 
+  text: string; 
+  tokens: TextToken[]; 
+  lines: { text: string; y: number }[];
+  isOcr?: boolean;
+};
 
 const STORAGE_KEY_BULLETINS = 'SENTINELA_BULLETIN_HISTORY';
 
@@ -45,10 +51,13 @@ export function useBulletinPipeline() {
       });
       setBulletinHistory(sorted);
       if (sorted.length > 0) setSelectedBulletinId(null);
+      setIsHistoryLoaded(true);
+      return sorted;
     } catch (e) {
       console.error("Erro ao carregar histórico do IndexedDB:", e);
+      setIsHistoryLoaded(true);
+      return [];
     }
-    setIsHistoryLoaded(true);
   };
 
   const runBulletinExtraction = async (
@@ -112,6 +121,60 @@ export function useBulletinPipeline() {
     setExtractedNotas([]);
   };
 
+  const runBulkExtraction = async (
+    personnel: MilitaryPerson[],
+    keywords: string[],
+    searchPrefs: SearchPreferences
+  ) => {
+    setState({ isProcessing: true, stage: 'parsing_pdf' });
+    try {
+      const manifestRes = await fetch('/boletins/manifest.json');
+      const files: string[] = await manifestRes.json();
+      
+      const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+      
+      let count = 0;
+      for (const filename of files) {
+        count++;
+        setState({ isProcessing: true, stage: 'parsing_pdf', errorMessage: `Processando ${count}/${files.length}: ${filename}` });
+        
+        // Pequena pausa para permitir que o navegador respire e limpe memória
+        await delay(500);
+
+        try {
+          const res = await fetch(`/boletins/${filename}`);
+          const blob = await res.blob();
+          const file = new File([blob], filename, { type: 'application/pdf' });
+          
+          const { pageMap: extracted } = await extractTextFromPdf(file);
+          const notas = await extractBulletinLocalAlgo(file, personnel, keywords, searchPrefs, extracted);
+          
+          if (notas && notas.length > 0) {
+            const id = crypto.randomUUID();
+            const newBulletin: StoredBulletin = {
+              id,
+              filename: file.name,
+              dateProcessed: new Date().toLocaleString('pt-BR'),
+              notas,
+            };
+            await saveBulletin(newBulletin);
+            setBulletinHistory(prev => [newBulletin, ...prev]);
+          }
+          
+          // "Limpeza" manual sugerida para blobs grandes
+        } catch (itemError) {
+          console.error(`Erro ao processar ${filename}:`, itemError);
+          // Continua para o próximo arquivo mesmo se um falhar
+        }
+      }
+      
+      setState({ isProcessing: false, stage: 'complete' });
+    } catch (error: any) {
+      console.error('[runBulkExtraction] Erro:', error);
+      setState({ isProcessing: false, stage: 'error', errorMessage: error.message || 'Erro na extração em lote.' });
+    }
+  };
+
   return {
     extractedNotas,
     bulletinHistory,
@@ -124,6 +187,7 @@ export function useBulletinPipeline() {
     setState,
     loadHistory,
     runBulletinExtraction,
+    runBulkExtraction,
     deleteBulletin,
     resetBulletin,
   };

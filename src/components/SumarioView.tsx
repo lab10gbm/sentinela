@@ -4,6 +4,7 @@ import { normalizeTitle } from '../services/textUtils';
 
 interface SumarioViewProps {
   nota: BulletinNota;
+  notas?: BulletinNota[];
   onNavigate?: (title: string) => void;
   onViewPage?: (page: number) => void;
 }
@@ -104,9 +105,29 @@ const PageNum: React.FC<{ page: string; size?: string }> = ({ page, size = 'text
   </span>
 );
 
-const SumarioView: React.FC<SumarioViewProps> = ({ nota, onNavigate, onViewPage }) => {
+const SumarioView: React.FC<SumarioViewProps> = ({ nota, notas = [], onNavigate, onViewPage }) => {
   const entries = parseSumarioLines(nota.contentMarkdown);
   const groups = groupByParte(entries);
+
+  // Índice rápido: normalizedTitle → isRelevant
+  const relevantIndex = React.useMemo(() => {
+    const map = new Map<string, boolean>();
+    notas.forEach(n => { if (n.isRelevant) map.set(normalizeTitle(n.title), true); });
+    return map;
+  }, [notas]);
+
+  const isEntryRelevant = (text: string) => {
+    const norm = normalizeTitle(text);
+    // Tenta match exato, depois parcial (sumário pode ter título abreviado)
+    if (relevantIndex.has(norm)) return true;
+    const words = norm.split(' ').filter(w => w.length > 3);
+    if (words.length < 2) return false;
+    for (const [key] of relevantIndex) {
+      const matched = words.filter(w => key.includes(w)).length;
+      if (matched >= Math.ceil(words.length * 0.7)) return true;
+    }
+    return false;
+  };
 
   const handleNavigate = (text: string, page: string | null) => {
     if (onViewPage && page) onViewPage(parseInt(page, 10));
@@ -195,10 +216,11 @@ const SumarioView: React.FC<SumarioViewProps> = ({ nota, onNavigate, onViewPage 
                 return (
                   <div
                     key={ci}
-                    className={`flex items-baseline gap-1 px-5 py-1.5 pl-14 bg-white hover:bg-gray-50/60 transition-colors border-t border-gray-50 ${onNavigate ? 'cursor-pointer hover:underline' : ''}`}
+                    className={`flex items-baseline gap-1 px-5 py-1.5 pl-14 border-t border-gray-50 transition-colors ${isEntryRelevant(child.text) ? 'bg-amber-50 hover:bg-amber-100' : 'bg-white hover:bg-gray-50/60'} ${onNavigate ? 'cursor-pointer' : ''}`}
                     onClick={() => onNavigate && handleNavigate(child.text, child.page)}
                   >
-                    <span className="text-[11.5px] text-gray-700 leading-snug flex-shrink-0 max-w-[68%]">
+                    <span className={`text-[11.5px] leading-snug flex-shrink-0 max-w-[68%] ${isEntryRelevant(child.text) ? 'text-amber-800 font-semibold' : 'text-gray-700'}`}>
+                      {isEntryRelevant(child.text) && <span className="mr-1 text-amber-500">★</span>}
                       {child.text}
                     </span>
                     {child.page ? (

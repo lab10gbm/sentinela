@@ -31,7 +31,7 @@ type ConfidenceTab = 'high' | 'medium' | 'low';
 const normalize = (text: string) => text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]/g, "");
 
 // --- HELPER COMPONENT: HIGHLIGHTER ---
-const Highlighter = ({ text, person }: { text: string, person?: MilitaryPerson }) => {
+const Highlighter = ({ text, person, confidence }: { text: string, person?: MilitaryPerson, confidence?: 'High' | 'Medium' | 'Low' }) => {
   if (!text) return null;
   if (!person) return <span>{text}</span>;
 
@@ -48,18 +48,26 @@ const Highlighter = ({ text, person }: { text: string, person?: MilitaryPerson }
         
         if (!cleanToken) return <span key={i}>{token}</span>;
 
-        // 1. NOME DE GUERRA (VERMELHO E NEGRITO)
+        // Decidimos a cor do destaque baseada na confiança
+        // Confiança Baixa/Média = Roxo (Fuzzy)
+        // Confiança Alta = Padrão (Fogo/Grafite)
+        const isFuzzy = confidence === 'Medium' || confidence === 'Low';
+
+        // 1. NOME DE GUERRA
         if (person.nomeGuerra) {
-            const warParts = normalize(person.nomeGuerra).split(' '); // Normalize war name parts too
-            // Exact match on normalized token
+            const warParts = normalize(person.nomeGuerra).split(' ');
             if (warParts.some(part => part === cleanToken)) {
-                return <span key={i} className="font-bold text-fire-600">{token}</span>;
+                return (
+                  <span key={i} className={`font-bold ${isFuzzy ? 'text-purple-600 bg-purple-50' : 'text-fire-600'}`}>
+                    {token}
+                  </span>
+                );
             }
         }
 
         let isOtherMatch = false;
 
-        // 2. RG (NEGRITO)
+        // 2. RG
         if (person.rg) {
             const cleanRg = person.rg.replace(/[^0-9]/g, ''); 
             const cleanTokenNum = token.replace(/[^0-9]/g, '');
@@ -68,7 +76,7 @@ const Highlighter = ({ text, person }: { text: string, person?: MilitaryPerson }
             }
         }
 
-        // 3. ID (NEGRITO)
+        // 3. ID
         if (person.idFuncional) {
             const cleanId = person.idFuncional.replace(/[^0-9]/g, '');
             const cleanTokenNum = token.replace(/[^0-9]/g, '');
@@ -77,7 +85,7 @@ const Highlighter = ({ text, person }: { text: string, person?: MilitaryPerson }
             }
         }
 
-        // 4. PARTES DO NOME COMPLETO (NEGRITO)
+        // 4. PARTES DO NOME COMPLETO
         if (person.nomeCompleto) {
              const nameParts = person.nomeCompleto.toLowerCase().split(' ').map(normalize).filter(p => p.length > 2);
              if (nameParts.includes(cleanToken)) {
@@ -86,7 +94,11 @@ const Highlighter = ({ text, person }: { text: string, person?: MilitaryPerson }
         }
 
         if (isOtherMatch) {
-            return <span key={i} className="font-bold text-gray-900">{token}</span>;
+            return (
+              <span key={i} className={`font-bold ${isFuzzy ? 'text-purple-700 bg-purple-50' : 'text-gray-900'}`}>
+                {token}
+              </span>
+            );
         }
 
         return <span key={i}>{token}</span>;
@@ -387,6 +399,22 @@ const ResultsView: React.FC<ResultsViewProps> = ({
          </div>
       )}
 
+      {/* --- FUZZY REVIEW BANNER --- */}
+      {activeMainTab === 'personnel' && (activeConfidenceTab === 'medium' || activeConfidenceTab === 'low') && groupedResults.length > 0 && (
+          <div className="bg-purple-100 border border-purple-200 rounded-xl p-4 flex items-start gap-4 animate-in slide-in-from-top-2">
+            <div className="bg-purple-600 p-2 rounded-lg text-white">
+                <AlertCircle className="w-6 h-6" />
+            </div>
+            <div>
+                <h3 className="font-bold text-purple-900">Modo de Revisão Industrial</h3>
+                <p className="text-sm text-purple-800">
+                    Estes militares foram sinalizados em <span className="font-bold">roxo</span> porque possuem nomes comuns ou evidência parcial. 
+                    Revise os dados abaixo e utilize as ações rápidas para confirmar (✓) ou descartar (✕).
+                </p>
+            </div>
+          </div>
+      )}
+
       {groupedResults.length === 0 ? (
         <div className="p-8 text-center text-gray-500 bg-white rounded-lg border border-dashed border-gray-200">
           <BookOpen className="w-12 h-12 mx-auto mb-3 text-gray-300" />
@@ -574,6 +602,24 @@ const ResultsView: React.FC<ResultsViewProps> = ({
                           `}>
                             SCORE: {item.relevanceScore}%
                           </div>
+
+                          {/* QUICK ACTIONS (Confirm / Discard) */}
+                          {(activeConfidenceTab === 'medium' || activeConfidenceTab === 'low') && (
+                              <div className="flex gap-1">
+                                  <button
+                                      className="p-1 px-2 rounded bg-green-50 text-green-600 border border-green-200 hover:bg-green-600 hover:text-white transition-all text-xs font-bold"
+                                      title="Confirmar Match"
+                                  >
+                                      ✓ Confirmar
+                                  </button>
+                                  <button
+                                      className="p-1 px-2 rounded bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white transition-all text-xs font-bold"
+                                      title="Descartar Match"
+                                  >
+                                      ✕ Descartar
+                                  </button>
+                              </div>
+                          )}
                         </div>
 
                         {/* AREA DE EDIÇÃO DE CORREÇÃO (ITEM) */}
@@ -634,7 +680,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({
                                
                                {item.isTableRow ? (
                                    <p className="font-mono whitespace-pre text-xs leading-snug" style={dynamicStyle}>
-                                      <Highlighter text={item.relatedContent} person={item.person} />
+                                      <Highlighter text={item.relatedContent} person={item.person} confidence={item.confidenceLevel} />
                                    </p>
                                ) : (
                                    // USO DO RENDERIZADOR MULTI-PARAGRAFO AQUI TAMBÉM SE NECESSÁRIO
@@ -642,7 +688,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({
                                    // MAS COM A CLASSE DE INDENTAÇÃO SE TIVER QUEBRA.
                                     item.relatedContent.split('\n').map((line, idx) => (
                                       <p key={idx} className="indent-8 text-gray-800" style={dynamicStyle}>
-                                         <Highlighter text={line} person={item.person} />
+                                         <Highlighter text={line} person={item.person} confidence={item.confidenceLevel} />
                                       </p>
                                     ))
                                )}

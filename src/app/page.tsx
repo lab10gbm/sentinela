@@ -44,10 +44,10 @@ function App() {
   const {
     extractedNotas, bulletinHistory, selectedBulletinId, setSelectedBulletinId,
     isHistoryLoaded, pageMap, setPageMap, state, setState,
-    loadHistory, runBulletinExtraction, deleteBulletin, resetBulletin,
+    loadHistory, runBulletinExtraction, runBulkExtraction, deleteBulletin, resetBulletin,
   } = useBulletinPipeline();
 
-  const { savedNotas, saveNota, removeNota, updateObservation, isSaved } = useSavedNotas();
+  const { savedNotas, saveNota, removeNota, updateObservation, isSaved, importNotas } = useSavedNotas();
 
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [results, setResults] = useState<ExtractionResult[]>([]);
@@ -86,6 +86,11 @@ function App() {
   const [resultFontSize, setResultFontSize] = useState<number>(11);
   const [isJustified, setIsJustified] = useState<boolean>(true);
 
+  // Dados da página atual para o Depurador Visual
+  const currentPageData = pageMap.find(p => p.page === viewPage);
+  const currentTokens = currentPageData?.tokens || [];
+  const currentIsOcr = !!currentPageData?.isOcr;
+
   const [keywords, setKeywords] = useState<string[]>(DEFAULT_KEYWORDS);
   const [targetContexts, setTargetContexts] = useState<string[]>(DEFAULT_CONTEXTS);
   const [isConfigLoaded, setIsConfigLoaded] = useState(false);
@@ -114,8 +119,8 @@ function App() {
     setIsConfigLoaded(true);
 
     // Load Bulletin History from IndexedDB
-    loadHistory().then(() => {
-      if (bulletinHistory.length > 0) {
+    loadHistory().then((bulletins) => {
+      if (bulletins && bulletins.length > 0) {
         setOpenTabs(prev => prev.includes('report') ? prev : ['report', ...prev]);
         setActiveTab('report');
       }
@@ -697,48 +702,47 @@ function App() {
                   />
                 </div>
 
-                {/* MAIN ACTION: LOCAL SEARCH */}
-                <button
-                  onClick={runLocalAnalysis}
-                  disabled={!pdfFile || personnel.length === 0 || state.isProcessing}
-                  className={`
-                    w-full py-4 rounded-lg font-bold text-white text-lg shadow-md transition-all flex items-center justify-center gap-2 mb-4
-                    ${(!pdfFile || personnel.length === 0) 
-                      ? 'bg-gray-300 cursor-not-allowed text-gray-500' 
-                      : 'bg-fire-600 hover:bg-fire-700 hover:shadow-lg active:scale-95'}
-                  `}
-                >
-                    {state.isProcessing && state.stage !== 'analyzing_ai' ? (
-                         <>
-                         <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                         </svg>
-                         PROCESSANDO DOC (LOCAL)...
-                       </>
-                    ) : (
-                        <>
-                        <Search className="w-5 h-5" />
-                        INICIAR VARREDURA LOCAL
-                        </>
-                    )}
-                </button>
-                
-                {/* EXTRAÇÃO DE NOTAS ESTRUTURADAS (LOCAL) */}
+                {/* MAIN ACTION: LOCAL SEARCH — em pausa, configurações preservadas */}
+                {/* O botão INICIAR VARREDURA LOCAL foi movido para abaixo do EXTRATOR */}
+
+                {/* EXTRAÇÃO DE NOTAS ESTRUTURADAS (LOCAL) — FOCO ATUAL */}
                 <button
                   id="btn-run-extraction"
                   onClick={handleRunBulletinExtraction}
                   disabled={!pdfFile || state.isProcessing}
                   className={`
-                    w-full py-3 rounded-lg font-bold text-fire-700 text-sm border-2 border-fire-600 bg-white transition-all flex items-center justify-center gap-2
-                    ${(!pdfFile) 
-                      ? 'border-gray-300 text-gray-400 cursor-not-allowed' 
-                      : 'hover:bg-fire-50 hover:shadow active:scale-95'}
+                    w-full py-4 rounded-lg font-bold text-white text-lg shadow-md transition-all flex items-center justify-center gap-2 mb-4
+                    ${(!pdfFile || state.isProcessing)
+                      ? 'bg-gray-300 cursor-not-allowed text-gray-500'
+                      : 'bg-fire-600 hover:bg-fire-700 hover:shadow-lg active:scale-95'}
                   `}
                 >
-                        <AlignJustify className="w-4 h-4" />
-                        TESTAR NOVO EXTRATOR (SEM IA)
+                  {state.isProcessing && state.stage !== 'analyzing_ai' ? (
+                    <>
+                      <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      PROCESSANDO...
+                    </>
+                  ) : (
+                    <>
+                      <AlignJustify className="w-5 h-5" />
+                      EXTRATOR
+                    </>
+                  )}
                 </button>
+
+                {/* INICIAR VARREDURA LOCAL — em pausa, não é o foco atual */}
+                <button
+                  disabled
+                  className="w-full py-3 rounded-lg font-bold text-gray-400 text-sm border-2 border-dashed border-gray-300 bg-gray-50 cursor-not-allowed flex items-center justify-center gap-2 mb-1"
+                  title="Funcionalidade em pausa — foco atual é o Extrator"
+                >
+                  <Search className="w-4 h-4" />
+                  INICIAR VARREDURA LOCAL
+                </button>
+                <p className="text-xs text-gray-400 text-center mb-3">em pausa — não é o foco atual</p>
 
                 {/* BOTÃO MÁGICO DE DEBUG */}
                 <button
@@ -756,6 +760,23 @@ function App() {
                   className="w-full py-2 bg-yellow-400 text-black font-bold rounded-lg mt-2"
                 >
                     DEBUG MAGICO MOCK FILE
+                </button>
+
+                {/* BOTÃO DE INJEÇÃO EM LOTE - FASE INDUSTRIAL */}
+                <button
+                  onClick={() => {
+                      if(window.confirm("Isso irá processar todos os 16 boletins da pasta local. Deseja continuar?")) {
+                          runBulkExtraction(personnel, keywords, searchPrefs);
+                      }
+                  }}
+                  disabled={state.isProcessing}
+                  className={`
+                    w-full py-3 mt-4 rounded-lg font-bold text-white shadow-lg transition-all flex items-center justify-center gap-2
+                    ${state.isProcessing ? 'bg-purple-400 cursor-not-allowed' : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 hover:shadow-xl active:scale-95'}
+                  `}
+                >
+                    <Bookmark className="w-5 h-5" />
+                    🚀 INJETAR TODOS OS BOLETINS
                 </button>
 
                 {/* BOTÃO SECUNDÁRIO: AUDITORIA DE ALGORITMO */}
@@ -949,12 +970,26 @@ function App() {
                                                   personnel={personnel}
                                                   searchPrefs={searchPrefs}
                                                   onSaveNota={(nota) => {
+                                                     const bulletin = bulletinHistory.find(b => b.id === selectedBulletinId);
+                                                     const filename = bulletin?.filename || 'boletim';
+                                                     const pageData = pageMap.find(p => p.page === nota.pageNumber);
+                                                     saveNota(nota, filename, 'relevant', {
+                                                       rawSourceTokens: pageData?.tokens,
+                                                       isOcrDerived: pageData?.isOcr
+                                                     });
+                                                   }}
+                                                   onSaveError={(nota) => {
+                                                     const bulletin = bulletinHistory.find(b => b.id === selectedBulletinId);
+                                                     const filename = bulletin?.filename || 'boletim';
+                                                     const pageData = pageMap.find(p => p.page === nota.pageNumber);
+                                                     saveNota(nota, filename, 'error', {
+                                                       rawSourceTokens: pageData?.tokens,
+                                                       isOcrDerived: pageData?.isOcr
+                                                     });
+                                                   }}
+                                                  isNotaSaved={(notaId, category) => {
                                                     const filename = bulletinHistory.find(b => b.id === selectedBulletinId)?.filename || 'boletim';
-                                                    saveNota(nota, filename);
-                                                  }}
-                                                  isNotaSaved={(notaId) => {
-                                                    const filename = bulletinHistory.find(b => b.id === selectedBulletinId)?.filename || 'boletim';
-                                                    return isSaved(notaId, filename);
+                                                    return isSaved(notaId, filename, category);
                                                   }}
                                               />
                                           </div>
@@ -967,7 +1002,7 @@ function App() {
                                                 >
                                                   {isPdfMaximized ? <AlignJustify className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
                                                 </button>
-                                                <PdfViewer file={pdfFile} initialPage={viewPage} />
+                                                <PdfViewer file={pdfFile} initialPage={viewPage} tokens={currentTokens} currentIsOcr={currentIsOcr} />
                                               </div>
                                           </div>
                                       </div>
@@ -1046,7 +1081,7 @@ function App() {
                                               >
                                                 {isPdfMaximized ? <AlignJustify className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
                                               </button>
-                                               <PdfViewer file={pdfFile} initialPage={viewPage} />
+                                               <PdfViewer file={pdfFile} initialPage={viewPage} tokens={currentTokens} currentIsOcr={currentIsOcr} />
                                             </div>
                                          </div>
                                       </div>
@@ -1067,7 +1102,7 @@ function App() {
                           {/* PDF TAB CONTENT */}
                           {activeTab === 'pdf' && (
                             <div className="flex flex-col h-full bg-gray-100 p-4">
-                               <PdfViewer file={pdfFile} initialPage={viewPage} />
+                               <PdfViewer file={pdfFile} initialPage={viewPage} tokens={currentTokens} currentIsOcr={currentIsOcr} />
                             </div>
                           )}
 
@@ -1155,6 +1190,7 @@ function App() {
                                   savedNotas={savedNotas}
                                   onRemove={removeNota}
                                   onUpdateObservation={updateObservation}
+                                  onImport={importNotas}
                                 />
                               </div>
                             </div>
@@ -1173,7 +1209,7 @@ function App() {
             </main>
           </div>
           
-          <footer className="bg-gray-800 text-gray-400 py-6 mt-auto z-50 relative">
+          <footer className="bg-gray-800 text-gray-400 py-6 mt-auto relative" style={{ zIndex: -1 }}>
               <div className="w-full px-4 sm:px-6 text-center text-sm">
                 <p>&copy; {new Date().getFullYear()} Sentinela 10º GBM. Todos os direitos reservados.</p>
                 <p className="text-xs mt-1 text-gray-600">Desenvolvido para uso interno administrativo.</p>

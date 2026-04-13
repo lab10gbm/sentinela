@@ -1,8 +1,6 @@
 
 import { ExtractionResult, MatchType, MilitaryPerson, SearchPreferences, TextToken } from "../types";
 import {
-  cleanHeaderArtifacts,
-  normalizeTextForOcr,
   normalizeSpaces,
   isVisualHeader,
   isTOCLine,
@@ -74,16 +72,25 @@ const createFuzzyNameRegex = (name: string): RegExp => {
   return new RegExp(`\\b${fuzzyParts.join('\\s+')}\\b`, 'gi');
 };
 
+const RANK_VARIATIONS: Record<string, string[]> = {
+  'SD': ['sd', 'soldado', 'sc'],
+  'CB': ['cb', 'cabo'],
+  'SGT': ['sgt', 'sargento', '1 sgt', '2 sgt', '3 sgt', '1º sgt', '2º sgt', '3º sgt'],
+  'SUBTEN': ['subten', 'subtenente', 'sub ten', 'sub-ten'],
+  'ASP': ['asp', 'aspirante'],
+  'TEN': ['ten', 'tenente', '1 ten', '2 ten', '1º ten', '2º ten'],
+  'CAP': ['cap', 'capitao'],
+  'MAJ': ['maj', 'major'],
+  'CEL': ['cel', 'coronel', 'ten cel', 'ten-cel', 'tencel'],
+};
+
 const extractRankFromText = (text: string): string | null => {
   const normalized = normalizeSimple(text);
-  if (/\b(sd|soldado)\b/.test(normalized)) return 'SD';
-  if (/\b(cb|cabo)\b/.test(normalized)) return 'CB';
-  if (/\b(sgt|sargento|1\s*sgt|2\s*sgt|3\s*sgt)\b/.test(normalized)) return 'SGT';
-  if (/\b(subten|subtenente|sub\s*ten)\b/.test(normalized)) return 'SUBTEN';
-  if (/\b(ten|tenente|1\s*ten|2\s*ten)\b/.test(normalized)) return 'TEN';
-  if (/\b(cap|capitao)\b/.test(normalized)) return 'CAP';
-  if (/\b(maj|major)\b/.test(normalized)) return 'MAJ';
-  if (/\b(cel|coronel|ten\s*cel)\b/.test(normalized)) return 'CEL';
+  for (const [rank, variations] of Object.entries(RANK_VARIATIONS)) {
+    for (const v of variations) {
+      if (new RegExp(`\\b${v}\\b`).test(normalized)) return rank;
+    }
+  }
   return null;
 };
 
@@ -117,56 +124,184 @@ const SUB_ITEM_KEYWORDS = [
   'REFERÊNCIA', 'PROGRAMAÇÃO'
 ];
 
+/**
+ * NOMES COMUNS (Industrial Rigor)
+ * Nomes que ocorrem com alta frequência e exigem evidência adicional (Patente + Partes do Nome).
+ */
+const COMMON_NAMES = new Set([
+  'silva', 'santos', 'oliveira', 'souza', 'rodrigues', 'ferreira', 'alves', 
+  'pereira', 'lima', 'gomes', 'costa', 'ribeiro', 'martins', 'carvalho', 
+  'almeida', 'lopes', 'soares', 'fernandes', 'vieira', 'barbosa'
+]);
+
 // --- INTEGRAÇÃO E ANÁLISE ---
 
 /**
- * Verifica se um militar do banco de dados está presente em uma linha de texto.
- * Retorna o nome completo do militar se encontrado, null caso contrário.
+ * Motor Único de Avaliação de Match (Cérebro Industrial)
+ * Aplica a "Lei do Combo" e a prioridade absoluta de RG/ID.
+ */
+export const evaluatePersonnelMatch = (
+  lineText: string,
+  person: MilitaryPerson,
+  prefs: SearchPreferences,
+  processedP?: any // Opcional: dados pré-processados (rank, cleanId, etc)
+) => {
+  const lineTextNorm = normalizeSimple(lineText);
+  const lineTextClean = lineText.replace(/[^0-9a-zA-Z]/g, '');
+  const isMilitary = isMilitaryRowStrict(lineText);
+
+  // Dados do militar
+  const p = processedP || {
+    cleanId: person.idFuncional ? person.idFuncional.replace(/[^0-9]/g, '').replace(/^0+/, '') : null,
+    cleanRg: person.rg ? person.rg.replace(/[^0-9]/g, '').replace(/^0+/, '') : null,
+    rank: person.postoGraduacao ? extractRankFromText(person.postoGraduacao) : null,
+    warNameParts: person.nomeGuerra ? normalizeSimple(person.nomeGuerra).split(' ').filter(x => x.length > 2) : []
+  };
+
+  let score = 0;
+  let reasons: string[] = [];
+
+  // Prio 1: ID MATCH (Certeza Absoluta — exige contexto "Id Funcional" ou "Id." próximo)
+  if (prefs.useIdFuncional && p.cleanId && p.cleanId.length > 4) {
+    if (lineTextClean.includes(p.cleanId)) {
+      const regex = createFuzzyNumberRegex(p.cleanId);
+      if (regex.test(lineText)) {
+        // Verifica contexto: o número deve estar precedido de "Id" ou "Funcional" na linha
+        const hasIdContext = /\bId(?:entifica[çc][aã]o)?\s*(?:Funcional)?\s*[:\s]/i.test(lineText) ||
+                             /\bId\s*\.\s*Func/i.test(lineText);
+        score = 100;
+        reasons.push("ID Funcional");
+        if (!hasIdContext) reasons.push("(sem contexto 'Id Funcional' — verificar)");
+        return { score, reasons, confidence: "High" as const };
+      }
+    }
+  }
+
+  // Prio 2: RG MATCH (Certeza Absoluta — exige contexto "RG" próximo ao número)
+  if (prefs.useRg && p.cleanRg && p.cleanRg.length > 4) {
+    if (lineTextClean.includes(p.cleanRg)) {
+      const regex = createFuzzyNumberRegex(p.cleanRg);
+      if (regex.test(lineText)) {
+        // Verifica contexto: o número deve estar precedido de "RG" na linha
+        // Isso evita falsos positivos com números de processo, portaria, etc.
+        const rgContextRegex = new RegExp(`\\bRG\\s*[:\\s]?\\s*[0-9.\\-\\s]*${p.cleanRg.split('').join('[.\\-\\s]*')}`, 'i');
+        const hasRgContext = rgContextRegex.test(lineText);
+        if (!hasRgContext) {
+          // Sem contexto "RG", não é certeza — cai para avaliação por nome
+        } else {
+          score = 100;
+          reasons.push("RG");
+          return { score, reasons, confidence: "High" as const };
+        }
+      }
+    }
+  }
+
+  // Prio 3: NOME — no extrator de boletim, nome isolado NUNCA é suficiente para confirmar
+  // pertencimento ao efetivo. Apenas RG ou ID Funcional têm essa certeza.
+  // O match por nome fica reservado para a varredura local (analyzeDocumentLocal),
+  // que tem contexto hierárquico mais rico para reduzir falsos positivos.
+  return { score: 0, reasons: [], confidence: "Low" as "High" | "Medium" | "Low" };
+};
+
+/**
+ * Verifica se uma linha contém o RG ou ID Funcional de um militar.
+ * Usado para confirmação no pipeline de dois estágios.
+ */
+const hasConfirmingNumber = (lineText: string, cleanRg: string | null, cleanId: string | null): boolean => {
+  const lineClean = lineText.replace(/[^0-9a-zA-Z]/g, '');
+  if (cleanId && cleanId.length > 4 && lineClean.includes(cleanId)) {
+    const idRegex = createFuzzyNumberRegex(cleanId);
+    if (idRegex.test(lineText)) return true;
+  }
+  if (cleanRg && cleanRg.length > 4 && lineClean.includes(cleanRg)) {
+    const rgRegex = createFuzzyNumberRegex(cleanRg);
+    if (rgRegex.test(lineText)) return true;
+  }
+  return false;
+};
+
+/**
+ * Verifica se uma linha contém o nome de guerra de um militar.
+ */
+const hasNameMatch = (lineTextNorm: string, warNameParts: string[], nomeGuerra: string, lineText: string): boolean => {
+  if (warNameParts.length === 0) return false;
+  const hasNamePart = warNameParts.some(part => lineTextNorm.includes(part));
+  if (!hasNamePart) return false;
+  const regex = createFuzzyNameRegex(nomeGuerra);
+  return regex.test(lineText);
+};
+
+/**
+ * Pipeline de dois estágios para o extrator de boletim.
  *
- * @param strictMode - Se true, desabilita match por nome de guerra (apenas ID/RG).
- *   Use true para linhas de tabela onde nomes parciais causam falsos positivos.
+ * Estágio 1 — Candidato: nome de guerra encontrado em alguma linha do bloco.
+ * Estágio 2 — Confirmação: RG ou ID Funcional encontrado no mesmo bloco.
+ *
+ * Só retorna match quando ambos os estágios passam.
+ * RG/ID sem nome também confirma (certeza absoluta).
+ */
+export const matchPersonnelInBlock = (
+  lines: string[],
+  personnel: MilitaryPerson[],
+  prefs: SearchPreferences
+): { name: string, confidence: 'High' | 'Medium' | 'Low' }[] => {
+  const found: { name: string, confidence: 'High' | 'Medium' | 'Low' }[] = [];
+
+  for (const person of personnel) {
+    const cleanId = person.idFuncional ? person.idFuncional.replace(/[^0-9]/g, '').replace(/^0+/, '') : null;
+    const cleanRg = person.rg ? person.rg.replace(/[^0-9]/g, '').replace(/^0+/, '') : null;
+    const warNameParts = person.nomeGuerra
+      ? normalizeSimple(person.nomeGuerra).split(' ').filter(x => x.length > 2)
+      : [];
+
+    let hasName = false;
+    let hasNumber = false;
+
+    for (const line of lines) {
+      const lineNorm = normalizeSimple(line);
+
+      // Estágio 1: nome de guerra
+      if (!hasName && prefs.useNomeGuerra && person.nomeGuerra) {
+        if (hasNameMatch(lineNorm, warNameParts, person.nomeGuerra, line)) {
+          hasName = true;
+        }
+      }
+
+      // Estágio 2: RG ou ID Funcional
+      if (!hasNumber) {
+        if (
+          (prefs.useRg && hasConfirmingNumber(line, cleanRg, null)) ||
+          (prefs.useIdFuncional && hasConfirmingNumber(line, null, cleanId))
+        ) {
+          hasNumber = true;
+        }
+      }
+
+      if (hasName && hasNumber) break;
+    }
+
+    // Só confirma se tiver número (RG ou ID). Nome sozinho não é suficiente.
+    if (hasNumber) {
+      const confidence = hasName ? 'High' : 'Medium'; // com nome = High, só número = Medium
+      found.push({ name: person.nomeCompleto, confidence });
+    }
+  }
+
+  return found;
+};
+
+/**
+ * Versão simplificada para o Parser de Boletim (linha única — mantida para compatibilidade).
+ * Para blocos de texto use matchPersonnelInBlock.
  */
 export const matchPersonnelInLine = (
   lineText: string,
   personnel: MilitaryPerson[],
   prefs: SearchPreferences,
   strictMode = false
-): string[] => {
-  const lineTextNorm = normalizeSimple(lineText);
-  const lineTextClean = lineText.replace(/[^0-9a-zA-Z]/g, '');
-  const isMilitary = isMilitaryRowStrict(lineText);
-  const found: string[] = [];
-
-  for (const p of personnel) {
-    const cleanId = p.idFuncional ? p.idFuncional.replace(/[^0-9]/g, '').replace(/^0+/, '') : null;
-    const cleanRg = p.rg ? p.rg.replace(/[^0-9]/g, '').replace(/^0+/, '') : null;
-    const warNameParts = p.nomeGuerra ? normalizeSimple(p.nomeGuerra).split(' ').filter(x => x.length > 2) : [];
-    let matched = false;
-
-    if (prefs.useIdFuncional && cleanId && cleanId.length > 4 && lineTextClean.includes(cleanId)) {
-      const regex = createFuzzyNumberRegex(cleanId);
-      if (regex.test(lineText)) matched = true;
-    }
-
-    if (!matched && prefs.useRg && cleanRg && cleanRg.length > 4 && lineTextClean.includes(cleanRg)) {
-      const regex = createFuzzyNumberRegex(cleanRg);
-      if (regex.test(lineText)) matched = true;
-    }
-
-    // Em strictMode (tabelas), não usa nome de guerra para evitar falsos positivos
-    if (!matched && !strictMode && prefs.useNomeGuerra && p.nomeGuerra && warNameParts.length > 0 && isMilitary) {
-      // Exige que TODAS as partes do nome de guerra estejam presentes (não apenas uma)
-      const allPartsPresent = warNameParts.every(part => lineTextNorm.includes(part));
-      if (allPartsPresent) {
-        const regex = createFuzzyNameRegex(p.nomeGuerra);
-        if (regex.test(lineText)) matched = true;
-      }
-    }
-
-    if (matched) found.push(p.nomeCompleto);
-  }
-
-  return found;
+): { name: string, confidence: 'High' | 'Medium' | 'Low' }[] => {
+  return matchPersonnelInBlock([lineText], personnel, prefs);
 };
 
 export const analyzeDocumentLocal = async (
@@ -212,7 +347,7 @@ export const analyzeDocumentLocal = async (
 
   for (let i = 0; i < allLines.length; i++) {
     const lineObj = allLines[i];
-    const lineText = normalizeSpaces(lineObj.text); // Normaliza espaços para análise
+    const lineText = normalizeSpaces(lineObj.text);
     const lineTextNorm = normalizeSimple(lineText);
     const lineTextSearch = normalizeForSearch(lineText); 
     const lineTextClean = lineText.replace(/[^0-9a-zA-Z]/g, ''); 
@@ -324,100 +459,14 @@ export const analyzeDocumentLocal = async (
         currentSectionAccumulator += lineText + "\n";
     }
 
-    // --- LOOP DE MILITARES (OTIMIZADO COM VALIDAÇÃO DE LINHA) ---
+    // --- LOOP DE MILITARES (OTIMIZADO COM O MOTOR ÚNICO) ---
     for (const p of processedPersonnel) {
-      let bestMatchScore = 0;
-      let foundItems: string[] = [];
       const person = p.original;
+      const matchResult = evaluatePersonnelMatch(lineText, person, prefs, p);
 
-      // 1. ID MATCH (Alta Confiança - Independente de ser linha militar estrita)
-      if (prefs.useIdFuncional && p.cleanId && p.cleanId.length > 4) {
-        if (lineTextClean.includes(p.cleanId)) {
-            const regex = createFuzzyNumberRegex(p.cleanId);
-            if (regex.test(lineText)) {
-                bestMatchScore = 100;
-                foundItems.push("ID Funcional");
-            }
-        }
-      }
-
-      // 2. RG MATCH (Alta Confiança)
-      if (bestMatchScore < 100 && prefs.useRg && p.cleanRg && p.cleanRg.length > 4) {
-        if (lineTextClean.includes(p.cleanRg)) {
-            const regex = createFuzzyNumberRegex(p.cleanRg);
-            if (regex.test(lineText)) {
-                bestMatchScore = 100;
-                foundItems.push("RG");
-            }
-        }
-      }
-
-      // 3. NOME MATCH (Condicional: Só se for linha militar ou tiver pontuação alta)
-      if (bestMatchScore < 100 && prefs.useNomeGuerra && person.nomeGuerra && p.warNameParts.length > 0) {
-        
-        // SÓ ENTRA AQUI SE: Já achou ID/RG OU Se a linha parece militar (Sd BM...)
-        if (isMilitary || bestMatchScore > 0) {
-            
-            const hasNamePart = p.warNameParts.some(part => lineTextNorm.includes(part));
-            if (hasNamePart) {
-                const regex = createFuzzyNameRegex(person.nomeGuerra);
-                if (regex.test(lineText)) {
-                    let currentScore = 30; 
-                    const reasons = ["Nome de Guerra"];
-                    const lineRank = extractRankFromText(lineText);
-                    const hasBM = /\bBM\b/i.test(lineText);
-
-                    if (p.rank && lineRank) {
-                        if (p.rank === lineRank) {
-                            currentScore += 45; 
-                            reasons.push(`Patente correta (${p.rank})`);
-                        }
-                    } else if (lineRank) {
-                         currentScore += 10;
-                         reasons.push(`Patente encontrada (${lineRank})`);
-                    }
-                    if (hasBM) currentScore += 10;
-                    
-                    const fullNameParts = normalizeSimple(person.nomeCompleto).split(' ').filter(x => x.length > 3);
-                    let nameMatches = 0;
-                    fullNameParts.forEach(part => {
-                        if (!p.warNameParts.includes(part) && lineTextNorm.includes(part)) nameMatches++;
-                    });
-
-                    if (nameMatches > 0) {
-                        currentScore += 25; 
-                        reasons.push(`+${nameMatches} partes do nome completo`);
-                    }
-
-                    bestMatchScore = Math.max(bestMatchScore, Math.min(85, currentScore)); 
-                    if (currentScore >= 30) foundItems.push(...reasons);
-                }
-            }
-        }
-      }
-
-      if (bestMatchScore > 0) {
-        // Validação Final de Segurança
-        // Se só achou nome de guerra (sem ID/RG) e score é baixo, descarta se não parecer militar
-        if (!foundItems.includes("ID Funcional") && !foundItems.includes("RG")) {
-             const nameToCheck = person.nomeGuerra || person.nomeCompleto.split(' ')[0];
-             const looseNameCheck = createFuzzyNameRegex(nameToCheck);
-             if (!looseNameCheck.test(lineText)) {
-                  bestMatchScore = 0; 
-             }
-             // Se score for baixo (<50) e não for linha militar explicita, descarta para evitar ruído
-             if (bestMatchScore < 50 && !isMilitary) {
-                 bestMatchScore = 0;
-             }
-        }
-      }
-
-      if (bestMatchScore > 0) {
-        let confidenceLevel: 'High' | 'Medium' | 'Low' = "Low";
-        if (bestMatchScore >= 90) confidenceLevel = "High";
-        else if (bestMatchScore >= 50) confidenceLevel = "Medium";
-        
-        const validationMsg = `${confidenceLevel} (${bestMatchScore}%): ${foundItems.join(', ')}.`;
+      if (matchResult.score > 0) {
+        const confidenceLevel = matchResult.confidence as 'High' | 'Medium' | 'Low';
+        const validationMsg = `${confidenceLevel} (${matchResult.score}%): ${matchResult.reasons.join(', ')}.`;
 
         const formattedBody = currentSectionAccumulator.trim() 
             ? formatOfficialDocumentText(currentSectionAccumulator) 
@@ -427,7 +476,7 @@ export const analyzeDocumentLocal = async (
           id: crypto.randomUUID(),
           type: MatchType.PERSONNEL,
           matchedText: `${person.nomeCompleto}`,
-          relevanceScore: bestMatchScore,
+          relevanceScore: matchResult.score,
           relatedContent: lineText, 
           section: fullSectionPath || "Seção não identificada",
           sectionBody: formattedBody,
