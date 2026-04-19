@@ -970,9 +970,15 @@ const NotasView: React.FC<NotasViewProps> = ({
                   <span
                     key={idx}
                     className="inline-flex items-center gap-1 bg-amber-50 border border-amber-300 text-amber-800 text-[11px] font-bold px-2.5 py-0.5 rounded-full"
+                    title={nota.matchedEntitiesReason?.[name] ? `Localizado por: ${nota.matchedEntitiesReason[name]}` : undefined}
                   >
                     <Star className="w-2.5 h-2.5 fill-amber-500 text-amber-500" />
                     {name}
+                    {nota.matchedEntitiesReason?.[name] && (
+                      <span className="text-[9px] font-normal text-amber-600 ml-0.5 opacity-75">
+                        via {nota.matchedEntitiesReason[name]}
+                      </span>
+                    )}
                   </span>
                 ))}
               </div>

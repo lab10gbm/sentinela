@@ -44,6 +44,7 @@ class TableRegistryImpl implements TableRegistry {
 
   lookup(page: number, type: TableType): ColumnBoundary[] | null {
     // Procura a entrada mais próxima dentro de ±PAGE_PROXIMITY páginas
+    // Primeiro tenta o tipo exato, depois qualquer tipo (para tabelas genéricas)
     const candidates = this.entries.filter(
       e => e.type === type && Math.abs(e.page - page) <= PAGE_PROXIMITY
     );

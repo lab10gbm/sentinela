@@ -404,13 +404,24 @@ const cleanAndFormatSlice = (
     const allTableTokens: TextToken[] = [];
     // Filtra tokens que são artefatos de kerning/rodapé (caracteres únicos repetidos)
     // Ex: **F** **F** **L** **L** **.** **.** **2** **2** = "FFLL..22" de rodapé
-    const isKerningArtifact = (tok: { text: string }) =>
-      tok.text.trim().length <= 1 && /^[A-Z0-9.º°,;:\-/]$/i.test(tok.text.trim());
+    //
+    // REGRA REFINADA: só descarta tokens de 1 char que são LETRAS MAIÚSCULAS isoladas.
+    // Dígitos ("1","2"...) e pontuação (".","º") fazem parte de dados reais (QTD, RG, etc.)
+    // e NÃO devem ser descartados mesmo em páginas com kerning.
+    const isKerningArtifact = (tok: { text: string }) => {
+      const t = tok.text.trim();
+      if (t.length > 1) return false;
+      // Só descarta letras maiúsculas isoladas (artefatos de rodapé tipo "F","L",".")
+      // Preserva: dígitos, ordinal "º"/"°", e qualquer coisa que possa ser dado real
+      return /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]$/.test(t);
+    };
 
     // Detecta linha inteira de kerning: maioria dos tokens tem 1 char
+    // Para detecção de linha de lixo, considera QUALQUER token de 1 char (letra ou dígito)
+    // pois rodapés fragmentados têm todos os chars separados (ex: "F","L",".","2","2")
     const isKerningLine = (tokens: { text: string }[]) => {
       if (tokens.length < 4) return false;
-      const singleChar = tokens.filter(t => isKerningArtifact(t)).length;
+      const singleChar = tokens.filter(t => t.text.trim().length === 1).length;
       return singleChar / tokens.length >= 0.6;
     };
 
@@ -418,18 +429,71 @@ const cleanAndFormatSlice = (
     // sem precisar calcular isKerningLine por linha (mais eficiente e mais abrangente)
     const pageHasKerning = actualTableLines.some(l => (l as any).hasKerningPage === true);
 
-    actualTableLines.forEach(line => {
+    // Divide actualTableLines em segmentos separados por subtítulos internos
+    // (ex: "3 MILITARES CAPACITADOS:" separa duas sub-tabelas dentro do mesmo bloco)
+    const segments: { lines: typeof actualTableLines; subtitle?: string }[] = [];
+    let currentSegment: typeof actualTableLines = [];
+    for (const line of actualTableLines) {
+      const plainLine = line.text.replace(/\*\*/g, '').trim();
+      if (!line.isBridge && isSubSectionTitle(plainLine)) {
+        // Fecha o segmento atual e inicia um novo com o subtítulo como rótulo
+        segments.push({ lines: currentSegment });
+        currentSegment = [];
+        segments.push({ lines: [], subtitle: line.text });
+      } else {
+        currentSegment.push(line);
+      }
+    }
+    segments.push({ lines: currentSegment });
+
+    // Identifica a linha de cabeçalho do primeiro segmento para herança em segmentos sem cabeçalho
+    const firstHeaderLine = segments
+      .find(s => s.subtitle === undefined && s.lines.some(l => !l.isBridge && isTableHeader(l.text)))
+      ?.lines.find(l => !l.isBridge && isTableHeader(l.text));
+
+    // Processa cada segmento: subtítulos viram parágrafos, linhas viram tokens de tabela
+    for (const seg of segments) {
+      if (seg.subtitle !== undefined) {
+        // Emite o subtítulo como parágrafo centralizado entre as tabelas
+        flushParagraph();
+        paragraphLines.push(`[CENTER]${seg.subtitle}`);
+        flushParagraph();
+        continue;
+      }
+      if (seg.lines.length === 0) continue;
+
+      console.log(`[flushTable] segmento lines=${seg.lines.length} firstText="${seg.lines[0]?.text?.substring(0,60)}" lastText="${seg.lines[seg.lines.length-1]?.text?.substring(0,60)}"`);
+
+      // Usa as linhas do segmento diretamente — o PDF repete o cabeçalho após subtítulos
+      const effectiveLines = seg.lines;
+
+      const allTableTokens: TextToken[] = [];
+
+      // Se o segmento não tem cabeçalho próprio, injeta tokens do cabeçalho do primeiro segmento
+      // com Y ajustado para ficar acima dos dados (no PDF.js: Y maior = mais acima na página)
+      const segHasHeader = seg.lines.some(l => !l.isBridge && isTableHeader(l.text));
+      if (!segHasHeader && firstHeaderLine && firstHeaderLine.tokens.length > 0) {
+        const firstDataLine = seg.lines.find(l => !l.isBridge && l.text.trim().length > 0);
+        if (firstDataLine) {
+          const headerY = firstDataLine.y + 20; // Y maior = acima dos dados no PDF.js
+          const headerTokens = firstHeaderLine.tokens.map(t => ({ ...t, y: headerY }));
+          allTableTokens.push(...headerTokens);
+        }
+      }
+      effectiveLines.forEach(line => {
       if (line.isBridge) {
         const plain = line.text.replace(/\*\*/g, '').trim();
         const isCellContinuation = plain.length < 80 && !isHardLegalParagraph(plain);
         if (!isCellContinuation) return;
         const lineTokens = line.tokens.filter(t => Math.abs(t.y - line.y) <= 10);
-        if (!pageHasKerning && isKerningLine(lineTokens)) return;
+        // Sempre verifica se a linha inteira é kerning (rodapé fragmentado), independente de pageHasKerning
+        if (isKerningLine(lineTokens)) return;
         allTableTokens.push(...lineTokens.filter(t => !isKerningArtifact(t)));
         return;
       }
       const lineTokens = line.tokens.filter(t => Math.abs(t.y - line.y) <= 4);
-      if (!pageHasKerning && isKerningLine(lineTokens)) return;
+      // Sempre verifica se a linha inteira é kerning
+      if (isKerningLine(lineTokens)) return;
       allTableTokens.push(...lineTokens.filter(t => !isKerningArtifact(t)));
     });
 
@@ -440,14 +504,14 @@ const cleanAndFormatSlice = (
       // Nesses blocos cada linha é um militar/civil completo — NÃO passar pelo reconstructTable
       // pois os gaps internos (posto | nome | RG) seriam interpretados como colunas.
       // Monta diretamente uma TableData de 1 coluna preservando o texto de cada linha.
-      const isSingleColPersonnelList = actualTableLines.some(
+      const isSingleColPersonnelList = effectiveLines.some(
         l => SINGLE_COL_LIST_RE.test(l.text.replace(/\*\*/g, '').trim())
       );
 
       let data: import("../types").TableData;
       let report: import("./TableValidator").TableValidationReport | null = null;
       if (isSingleColPersonnelList) {
-        const rows = actualTableLines
+        const rows = effectiveLines
           .filter(l => !l.isBridge && l.text.trim().length > 0)
           .map((l, idx) => [{
             text: l.text.trim(),
@@ -456,7 +520,7 @@ const cleanAndFormatSlice = (
           }]);
         data = { rows, columnCount: 1, rowCount: rows.length };
       } else {
-        const validated = validateAndReconstruct(uniqueTokens, actualTableLines);
+        const validated = validateAndReconstruct(uniqueTokens, effectiveLines);
         data = validated.data;
         report = validated.report;
         if (validated.report.needsManualReview) {
@@ -471,9 +535,10 @@ const cleanAndFormatSlice = (
         const gridLines = data.rows.map(row => row.map(cell => cell.text).join(" | "));
         processedBlocks.push(`\`\`\`grid-tab-${tableIdx}\n` + gridLines.join("\n") + "\n```");
       } else {
-        paragraphLines.push(...actualTableLines.filter(l => !l.isBridge).map(l => l.text));
+        paragraphLines.push(...effectiveLines.filter(l => !l.isBridge).map(l => l.text));
       }
     }
+    } // fecha for (const seg of segments)
     tableLines = [];
   };
 
@@ -533,14 +598,41 @@ const cleanAndFormatSlice = (
      }
   }
 
+  // ── Helpers para bridge multi-página ────────────────────────────────────────
+  /**
+   * Extrai as palavras-chave do cabeçalho de uma tabela (remove bold markers e normaliza).
+   * Retorna array de palavras com ≥ 2 chars para comparação fuzzy.
+   */
+  const extractHeaderKeywords = (text: string): string[] =>
+    normalizeTitle(text).split(/\s+/).filter(w => w.length >= 2);
+
+  /**
+   * Compara dois cabeçalhos de tabela por similaridade fuzzy.
+   * Retorna true se ≥ 60% das palavras do cabeçalho menor estão no maior.
+   * Isso permite conectar "QTD | POSTO/GRAD. | NOME | RG | ID FUNCIONAL | OBM"
+   * mesmo quando a repetição de página omite alguma coluna.
+   */
+  const headersAreSimilar = (a: string, b: string): boolean => {
+    if (!a || !b) return false;
+    const wa = extractHeaderKeywords(a);
+    const wb = extractHeaderKeywords(b);
+    if (wa.length === 0 || wb.length === 0) return false;
+    const [shorter, longer] = wa.length <= wb.length ? [wa, wb] : [wb, wa];
+    const matches = shorter.filter(w => longer.includes(w)).length;
+    return matches / shorter.length >= 0.6;
+  };
+
   for (let i = 0; i < lineTypes.length; i++) {
     if (lineTypes[i].isTable && !lineTypes[i].isBridge) {
         let j = i + 1; while (j < lineTypes.length && lineTypes[j].isTable) j++;
         if (j < lineTypes.length) {
             let nextTableIdx = -1;
             let containsHardBreak = false;
-            let hardBreakIsClosingFormula = false; // "Em consequência..." entre páginas de tabela
-            for (let k = j; k < Math.min(j + 25, lineTypes.length); k++) {
+            let hardBreakIsClosingFormula = false;
+            // Aumentado de 25 → 50 para cobrir quebras de página com cabeçalho repetido
+            // mais rodapé + cabeçalho de página (pode ser ~10-15 linhas de gap)
+            const BRIDGE_LOOKAHEAD = 50;
+            for (let k = j; k < Math.min(j + BRIDGE_LOOKAHEAD, lineTypes.length); k++) {
                 if (lineTypes[k].isTable) { nextTableIdx = k; break; }
                 const plainText = lineTypes[k].obj.text.trim().replace(/\*\*/g, '');
                 if (isSubSectionTitle(plainText) || isRectificationMarker(plainText)) {
@@ -551,38 +643,53 @@ const cleanAndFormatSlice = (
                 }
             }
 
-            // Se o hard break é só fórmula de encerramento E o próximo bloco tem mesmo cabeçalho,
-            // trata como tabela multi-página e faz bridge atravessando a fórmula.
-            if (hardBreakIsClosingFormula && !containsHardBreak && nextTableIdx !== -1) {
-                const currentHeaderText = normalizeTitle(
-                    lineTypes.slice(i, j).find(l => isTableHeader(l.obj.text))?.obj.text ?? ''
-                );
-                const nextHeaderText = normalizeTitle(
+            // Se o hard break é só fórmula de encerramento OU o próximo bloco tem cabeçalho
+            // similar (tabela multi-página), faz bridge atravessando o gap.
+            if (nextTableIdx !== -1 && !containsHardBreak) {
+                const currentHeaderText =
+                    lineTypes.slice(i, j).find(l => isTableHeader(l.obj.text))?.obj.text ?? '';
+                const nextHeaderText =
                     lineTypes.slice(nextTableIdx, Math.min(nextTableIdx + 5, lineTypes.length))
-                        .find(l => isTableHeader(l.obj.text))?.obj.text ?? ''
-                );
-                const sameTable = currentHeaderText.length > 0 && nextHeaderText.length > 0 &&
-                    currentHeaderText === nextHeaderText;
-                if (!sameTable) {
-                    containsHardBreak = true; // cabeçalhos diferentes → tabelas distintas
+                        .find(l => isTableHeader(l.obj.text))?.obj.text ?? '';
+
+                // Usa similaridade fuzzy em vez de igualdade exata
+                const sameTable = headersAreSimilar(currentHeaderText, nextHeaderText);
+
+                if (hardBreakIsClosingFormula && !sameTable) {
+                    containsHardBreak = true; // fórmula de encerramento + cabeçalhos distintos → tabelas distintas
                 }
             }
 
             if (nextTableIdx !== -1 && !containsHardBreak) {
-                // Bridge protection: if the gap contains many lines and they look like 
-                // actual text paragraphs (many words, normal casing), don't bridge.
+                // Bridge protection: se o gap tem muitas linhas que parecem parágrafos
+                // narrativos (sem padrão militar), não faz bridge.
                 let bridgeLinesCount = nextTableIdx - j;
                 let looksLikeParagraph = 0;
                 for (let k = j; k < nextTableIdx; k++) {
                     const line = lineTypes[k].obj.text.trim();
-                    // Não conta linhas com padrão militar como parágrafo
-                    // (linhas fundidas de dados militares têm muitos espaços mas são tabela)
                     const hasMilRank = /\b(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel)\s+BM\b/i.test(line);
                     const hasRG = /\b\d{1,2}\.\d{3}\b/.test(line);
                     if (!hasMilRank && !hasRG && line.length > 50 && (line.match(/\s/g) || []).length > 8) looksLikeParagraph++;
                 }
 
-                if (bridgeLinesCount < 8 || looksLikeParagraph < 3) {
+                // Cabeçalhos iguais = mesma tabela multi-página → gap maior permitido
+                const currentHeaderText2 =
+                    lineTypes.slice(i, j).find(l => isTableHeader(l.obj.text))?.obj.text ?? '';
+                const nextHeaderText2 =
+                    lineTypes.slice(nextTableIdx, Math.min(nextTableIdx + 5, lineTypes.length))
+                        .find(l => isTableHeader(l.obj.text))?.obj.text ?? '';
+                // Considera mesma tabela se: cabeçalhos similares OU bloco atual não tem cabeçalho
+                // mas tem dados militares e o próximo tem cabeçalho militar (quebra de página)
+                const currentHasMilitaryData = lineTypes.slice(i, j).some(lt => {
+                    const p = lt.obj.text.replace(/\*\*/g, '').trim();
+                    return /\b(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel)\s+BM\b/i.test(p) || /\b\d{1,2}\.\d{3}\b/.test(p);
+                });
+                const isSameTableBridge = headersAreSimilar(currentHeaderText2, nextHeaderText2) ||
+                    (!currentHeaderText2 && nextHeaderText2 && currentHasMilitaryData);
+
+                // Mesma tabela: até 60 linhas de gap; tabelas distintas: até 20
+                const maxBridgeGap = isSameTableBridge ? 60 : 20;
+                if (bridgeLinesCount <= maxBridgeGap && looksLikeParagraph < 3) {
                     for (let k = j; k < nextTableIdx; k++) {
                         lineTypes[k].isTable = true;
                         lineTypes[k].isBridge = true;
@@ -614,13 +721,13 @@ const cleanAndFormatSlice = (
 
     // Tenta o primeiro token primeiro (caso mais comum)
     const numFirst = parseInt(tokens[0], 10);
-    if (!isNaN(numFirst) && numFirst >= lastTableRowNumber + 1 && numFirst <= lastTableRowNumber + 3) return true;
+    if (!isNaN(numFirst) && numFirst >= lastTableRowNumber + 1 && numFirst <= lastTableRowNumber + 5) return true;
 
     // Procura o número sequencial em qualquer posição, confirmado por posto militar seguinte
     for (let ti = 0; ti < tokens.length; ti++) {
       const n = parseInt(tokens[ti], 10);
       if (isNaN(n)) continue;
-      if (n < lastTableRowNumber + 1 || n > lastTableRowNumber + 3) continue;
+      if (n < lastTableRowNumber + 1 || n > lastTableRowNumber + 5) continue;
       // Confirma que é seguido de posto/graduação militar
       const nextTok = tokens[ti + 1] ?? "";
       if (/^(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel|BM|Q\d)/i.test(nextTok)) return true;
@@ -645,16 +752,29 @@ const cleanAndFormatSlice = (
       );
 
       // Extrai o último número de QTD visto no bloco (para detector de sequência)
+      // Busca em qualquer posição da linha (não só firstTok), confirmado por posto militar seguinte
       let lastRowNumber = 0;
-      for (let b = blockEnd - 1; b >= i; b--) {
+      outer: for (let b = blockEnd - 1; b >= i; b--) {
         const bPlain = lineTypes[b].obj.text.replace(/\*\*/g, "").trim();
-        const firstTok = bPlain.split(/\s+/)[0];
-        const n = parseInt(firstTok, 10);
-        if (!isNaN(n) && n > 0) { lastRowNumber = n; break; }
+        const bToks = bPlain.split(/\s+/);
+        // Tenta primeiro token (caso mais comum)
+        const nFirst = parseInt(bToks[0], 10);
+        if (!isNaN(nFirst) && nFirst > 0) { lastRowNumber = nFirst; break; }
+        // Busca em qualquer posição confirmada por posto/graduação seguinte
+        for (let ti = 0; ti < bToks.length; ti++) {
+          const n = parseInt(bToks[ti], 10);
+          if (isNaN(n) || n <= 0) continue;
+          const nextTok = bToks[ti + 1] ?? "";
+          if (/^(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel|BM|Q\d)/i.test(nextTok)) {
+            lastRowNumber = n;
+            break outer;
+          }
+        }
       }
       if (blockTokens.length > 0) {
         const analysis = inferColumnBoundaries(blockTokens);
         if (analysis.confidence >= 0.4 && analysis.boundaries.length >= 3) {
+          console.log(`[Pass3] Bloco tabela i=${i} blockEnd=${blockEnd} lastRow=${lastRowNumber} conf=${analysis.confidence.toFixed(2)} bounds=${analysis.boundaries.length}`);
           // Varre as linhas imediatamente após o bloco
           for (let k = blockEnd; k < lineTypes.length; k++) {
             if (lineTypes[k].isTable) break; // encontrou outro bloco, para
@@ -665,7 +785,10 @@ const cleanAndFormatSlice = (
             if (isPageHeaderOrFooter(plain)) continue;
             // Rejeita artefatos de paginação com letras duplicadas + número (ex: "FFLL..11", "PPGG.5")
             if (/^[A-Z]{2,}[.\s]*\d+$/i.test(plain) && /([A-Z])\1/i.test(plain)) continue;
-            if (isHardLegalParagraph(plain) || isRectificationMarker(plain)) break;
+            if (isHardLegalParagraph(plain) || isRectificationMarker(plain)) {
+              console.log(`[Pass3] STOP em linha ${k}: "${plain.substring(0, 60)}"`);
+              break;
+            }
             if (REGEX_PARTE_PREFIX.test(plain) || REGEX_EIXO_PREFIX.test(plain)) break;
 
             const lineTokens = lt.obj.tokens.filter(t => Math.abs(t.y - lt.obj.y) <= 5);
@@ -702,9 +825,22 @@ const cleanAndFormatSlice = (
               lineTypes[k].isTable = true;
               lineTypes[k].isBridge = true;
               // Atualiza lastRowNumber para encadeamento sequencial
-              const firstTok = plain.split(/\s+/)[0];
-              const n = parseInt(firstTok, 10);
-              if (!isNaN(n) && n > 0) lastRowNumber = n;
+              // Busca em qualquer posição (não só firstTok) para linhas com OBM prefixado
+              const plainToks = plain.split(/\s+/);
+              const nFirst = parseInt(plainToks[0], 10);
+              if (!isNaN(nFirst) && nFirst > 0) {
+                lastRowNumber = nFirst;
+              } else {
+                for (let ti = 0; ti < plainToks.length; ti++) {
+                  const n = parseInt(plainToks[ti], 10);
+                  if (isNaN(n) || n <= 0) continue;
+                  const nextTok = plainToks[ti + 1] ?? "";
+                  if (/^(Cb|Sd|Sgt|Subten|Ten|Cap|Maj|Cel|BM|Q\d)/i.test(nextTok)) {
+                    lastRowNumber = n;
+                    break;
+                  }
+                }
+              }
             }
           }
         }
@@ -831,16 +967,18 @@ export const extractBulletinLocalAlgo = async (
 
   const checkRelevance = (content: string) => {
     const matchedEntities: string[] = [];
+    const matchedEntitiesReason: Record<string, 'RG' | 'ID Funcional' | 'Nome'> = {};
     let isRelevant = false;
     let hasFuzzyMatch = false;
 
-    // Pipeline de dois estágios: nome encontrado no bloco + RG/ID confirmando no mesmo bloco.
-    // matchPersonnelInBlock recebe todas as linhas e só confirma quando há número (RG/ID).
     const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
     const matchedPersonnel = matchPersonnelInBlock(lines, personnelInput, preferences);
     if (matchedPersonnel.length > 0) {
       matchedPersonnel.forEach(p => {
-        if (!matchedEntities.includes(p.name)) matchedEntities.push(p.name);
+        if (!matchedEntities.includes(p.name)) {
+          matchedEntities.push(p.name);
+          matchedEntitiesReason[p.name] = p.matchedBy;
+        }
         if (p.confidence !== 'High') hasFuzzyMatch = true;
       });
       isRelevant = true;
@@ -849,6 +987,7 @@ export const extractBulletinLocalAlgo = async (
     return { 
         isRelevant, 
         matchedEntities: Array.from(new Set(matchedEntities)),
+        matchedEntitiesReason,
         hasFuzzyMatch
     };
   };
@@ -1025,6 +1164,12 @@ export const extractBulletinLocalAlgo = async (
         const lineTokens = line.tokens.filter(t => Math.abs(t.y - line.y) <= 6);
         const boldRatio = lineTokens.length > 0 ? lineTokens.filter(t => t.isBold).length / lineTokens.length : 0;
         if (boldRatio < 0.5) continue;
+        // Rejeita linhas de dados de tabela de pessoal: "02 Cap BM QOC/13 NOME 49.117 GOA"
+        // Padrão: número sequencial + posto militar + nome + RG (5 dígitos com ponto) + OBM
+        const TABLE_DATA_ROW_RE = /^\d+\s+(Cap|Ten|Cel|Maj|Sgt|Cb|Sd|Sub|Asp|Al)\s+BM\b/i;
+        if (TABLE_DATA_ROW_RE.test(plain)) continue;
+        // Também rejeita se contém RG no formato "NN.NNN" (5 dígitos com ponto) — dado de tabela
+        if (/\b\d{2}\.\d{3}\b/.test(plain) && /\b(Cap|Ten|Cel|Maj|Sgt|Cb|Sd|Sub)\b/i.test(plain)) continue;
         // Rejeita itens internos de ato administrativo: verbos no infinitivo em CAIXA ALTA
         // seguidos de vírgula ou texto em minúsculas (ex: "2. TRANSFERIR, com fulcro...")
         // Esses são cláusulas de resolução/portaria, não títulos de nota independente.
@@ -1202,7 +1347,7 @@ export const extractBulletinLocalAlgo = async (
       text: l.text, page: l.page, tokens: l.tokens, y: l.y
     }));
     const { text, pages, tables, tableReports } = cleanAndFormatSlice(slice);
-    const { isRelevant, matchedEntities, hasFuzzyMatch } = checkRelevance(text + " " + rawTitle);
+    const { isRelevant, matchedEntities, matchedEntitiesReason, hasFuzzyMatch } = checkRelevance(text + " " + rawTitle);
 
     // displayHierarchy
     const isBeforeOperacoes = !item.parentCategory ||
@@ -1248,6 +1393,7 @@ export const extractBulletinLocalAlgo = async (
       isHeaderOnly: isStructuralHeader && text.trim().length < 5,
       isRelevant,
       matchedEntities,
+      matchedEntitiesReason,
       hasFuzzyMatch,
       ...(notaEmissor && { notaEmissor }),
       ...(notaNumero && { notaNumero }),

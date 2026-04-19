@@ -90,6 +90,8 @@ export interface BulletinNota {
   isHeaderOnly?: boolean;
   isRelevant?: boolean;
   matchedEntities?: string[];
+  /** Motivo do match por militar: RG, ID Funcional ou Nome */
+  matchedEntitiesReason?: Record<string, 'RG' | 'ID Funcional' | 'Nome'>;
   /** Indica se algum match de militar foi realizado via lógica Fuzzy (Roxo) */
   hasFuzzyMatch?: boolean;
   /** Emissor da nota (ex: "CI/JD", "DGP/GAB.DIR.", "DI/DIV.INST/CSMONT") */

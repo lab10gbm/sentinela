@@ -21,8 +21,14 @@ export const reconstructTable = (tokens: TextToken[]): TableData => {
   const explodedTokens = explodeStickyTokens(tokens);
 
   // Heuristic 1: If it has a clear header, use template regardless of density
+  // Verifica linha a linha (não o texto concatenado) para evitar falsos negativos
+  // quando o allText ultrapassa o limite de 80 chars do isTableHeader
   const allText = tokens.map(t => t.text).join(" ");
-  if (isTableHeader(allText)) {
+  const lineTexts = Array.from(
+    new Map(tokens.map(t => [Math.round(t.y / 5), t])).values()
+  ).map(t => tokens.filter(tok => Math.abs(tok.y - t.y) <= 5).map(tok => tok.text).join(" "));
+  const hasHeaderLine = isTableHeader(allText) || lineTexts.some(lt => isTableHeader(lt));
+  if (hasHeaderLine) {
     console.log(`[TableReconstructor] Using TEMPLATE (header detected)`);
     return reconstructTableByTemplate(explodedTokens);
   }
@@ -397,7 +403,28 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     }
 
   // ─── 2. Build Phrase Blocks within each line ──────────────────────────────
-  const WORD_SPACE_THRESHOLD = 6; 
+  // Threshold adaptativo: calcula o espaçamento mediano entre tokens consecutivos
+  // na tabela inteira. Isso evita que PDFs com fontes comprimidas (gap real < 6px)
+  // fundam colunas distintas num único PhraseBlock.
+  const allGaps: number[] = [];
+  for (const line of rawLines) {
+    const sorted = [...line.tokens].sort((a, b) => a.x - b.x);
+    for (let gi = 1; gi < sorted.length; gi++) {
+      const g = sorted[gi].x - (sorted[gi - 1].x + sorted[gi - 1].w);
+      if (g > 0 && g < 200) allGaps.push(g); // ignora gaps negativos (sobreposição) e muito grandes
+    }
+  }
+  // Mediana dos gaps: separa ruído de espaçamento real entre palavras
+  let WORD_SPACE_THRESHOLD = 6; // fallback padrão
+  if (allGaps.length >= 4) {
+    allGaps.sort((a, b) => a - b);
+    const median = allGaps[Math.floor(allGaps.length / 2)];
+    // Threshold = 2× mediana, limitado entre 4px e 20px
+    // - 4px mínimo: evita que kerning normal quebre palavras
+    // - 20px máximo: evita que tabelas muito esparsas nunca separem colunas
+    WORD_SPACE_THRESHOLD = Math.min(20, Math.max(4, median * 2));
+    console.log(`[TableReconstructor] Threshold adaptativo: mediana=${median.toFixed(1)}px → threshold=${WORD_SPACE_THRESHOLD.toFixed(1)}px (${allGaps.length} gaps amostrados)`);
+  }
 
   interface PhraseBlock {
     xLeft: number;
@@ -453,11 +480,13 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         const isQuadroToName   = isQuadroCurrent && isNameStart;     // "QOC/09" | "THIAGO"
         const isNameToRg       = isNameEnd && isRgValueStart;        // "DIAS" | "45.320"
         const isRgToId         = /^\d{1,2}\.\d{3}$/.test(cText) && isIdValueStart; // "45.320" | "43599087"
+        // ID Funcional seguido de número de processo SEI
+        const isIdToSei        = /^\d{7,10}$/.test(cText) && /^SEI[-\s]/i.test(nText);
 
         const hasStickySlash = (cText.endsWith('/') || nText.startsWith('/'));
         const semanticSplit  = ((isHeaderAnchor || isHeaderEnd) && isNewHeaderStart) || hasStickySlash
           || isQtyToRank || isRankToName || isRankToQuadro
-          || isQuadroToName || isNameToRg || isRgToId;
+          || isQuadroToName || isNameToRg || isRgToId || isIdToSei;
         if (gap > WORD_SPACE_THRESHOLD || semanticSplit) {
           linePhrases.push(cur);
           cur = { xLeft: tok.x, xRight: tok.x + tok.w, y: tok.y, page: tok.page || 0, text: tokText, tokens: [tok] };
@@ -470,25 +499,21 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     }
     if (cur) linePhrases.push(cur);
 
-    // LOG DIAGNÓSTICO: mostra PhraseBlocks de linhas de dados militares
-    const lineTextRaw = linePhrases.map(p => p.text.replace(/\*\*/g, '')).join(' | ');
-    if (MILITARY_RANK_RE.test(lineTextRaw) && !isTableHeader(lineTextRaw)) {
-      console.log(`[TableReconstructor][PHRASES] y=${Math.round(line.y)} → [${linePhrases.map(p => `"${p.text.replace(/\*\*/g,'').substring(0,20)}" x=${Math.round(p.xLeft)}`).join(', ')}]`);
-    }
-    
     // EXPLOSÃO MULTIDIRECIONAL DE CABEÇALHOS:
     // Se a linha parece ser cabeçalho, quebramos frases que contenham múltiplas âncoras.
     const lineText = linePhrases.map(p => p.text).join(" ");
     if (isTableHeader(lineText)) {
       const exploded: PhraseBlock[] = [];
       const anchors = [
-        { regex: /QTD|ORDEM|N[º°]/i, width: 0.05, label: "**QTD**" },
+        { regex: /^Or\b|^Or\.|ORDEM|QTD|N[º°]/i, width: 0.05, label: "**QTD**" },
         { regex: /POSTO|GRAD/i, width: 0.15, label: "**POSTO/GRAD.**" },
-        { regex: /NOME/i, width: 0.4, label: "**NOME**" },
-        { regex: /RG/i, width: 0.1, label: "**RG**" },
+        { regex: /NOME/i, width: 0.35, label: "**NOME**" },
+        { regex: /\bRG\b/i, width: 0.1, label: "**RG**" },
         { regex: /ID\s*FUNCIONAL|ID\s*FUNC|IDENTIDADE\s+FUNC/i, width: 0.1, label: "**ID FUNCIONAL**" },
         { regex: /OBM|DBM|GBM|UNIDADE/i, width: 0.1, label: "**OBM**" },
-        { regex: /INSCRIÇÃO|INSC/i, width: 0.1, label: "**INSCRIÇÃO**" }
+        { regex: /INSCRIÇÃO|INSC/i, width: 0.1, label: "**INSCRIÇÃO**" },
+        // SEI deve vir DEPOIS de ID FUNCIONAL para não ser absorvido por ela
+        { regex: /SEI[\s(-]|SOLICITAÇÃO/i, width: 0.15, label: "**SEI (SOLICITAÇÃO)**" },
       ];
 
       for (const p of linePhrases) {
@@ -589,30 +614,79 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
 
   // ─── 3. Template Discovery (Super-Header Aggregation Strategy) ───────────
   let templateLine: PhraseBlock[] | null = null;
+  // Guarda os Y de TODAS as linhas físicas que compõem o super-header.
+  // Usado no passo 5 para pular essas linhas quando o modo autoritativo estiver ativo.
+  const superHeaderYValues = new Set<number>();
+  // Guarda apenas os Y das linhas SECUNDÁRIAS absorvidas (não a linha principal do template).
+  // Essas linhas devem ser puladas no passo 5 mesmo fora do modo autoritativo,
+  // pois já foram incorporadas ao templateLine e não devem ser tratadas como dados.
+  const absorbedHeaderYValues = new Set<number>();
   
   for (let i = 0; i < allLinesPhrases.length; i++) {
     const currentLinesTokens = allLinesPhrases[i];
     const lineText = currentLinesTokens.map(p => p.text).join(" ").toUpperCase();
     
     if (isTableHeader(lineText)) {
+      // GUARDA DE DADOS: se a linha contém dados militares reais além do cabeçalho,
+      // não é um cabeçalho puro — é uma linha mista (cabeçalho + dados na mesma linha física).
+      // Nesse caso, não registrar como cabeçalho para evitar que dados sejam absorvidos no templateLine.
+      const lineRawText = currentLinesTokens.map(p => p.text.replace(/\*\*/g, '')).join(" ");
+      const lineHasData =
+        /\bRG[\s:]*\d/i.test(lineRawText) ||
+        /Id\s*Funcional\s*\d/i.test(lineRawText) ||
+        /,\s*RG\b/i.test(lineRawText) ||
+        /\b(Ten\s+Cel|Subten|[123][°º]\s*Sgt|[12][°º]\s*Ten|Cel\s+BM|Maj\s+BM|Cap\s+BM|Sgt\s+BM|Cb\s+BM|Sd\s+BM)\b.*[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{3,}/i.test(lineRawText);
+      if (lineHasData) {
+        // Linha mista: trata como dado normal, não como cabeçalho
+        continue;
+      }
+
+      // Registra os Y da linha inicial do cabeçalho
+      for (const p of currentLinesTokens) {
+        superHeaderYValues.add(Math.round(p.y));
+      }
+
       // TENTATIVA DE AGREGAÇÃO: Se a linha de baixo também parece cabeçalho, unimos!
       let superHeader = [...currentLinesTokens];
+      // Guarda o Y da última linha absorvida para calcular dist incremental
+      let lastAbsorbedY = currentLinesTokens[0].y;
       let nextIdx = i + 1;
       while (nextIdx < allLinesPhrases.length) {
         const nextLine = allLinesPhrases[nextIdx];
         const nextText = nextLine.map(p => p.text).join(" ").toUpperCase();
-        const dist = Math.abs(nextLine[0].y - currentLinesTokens[0].y);
+        // Distância incremental: da última linha absorvida, não da primeira
+        const dist = Math.abs(nextLine[0].y - lastAbsorbedY);
+
+        // GUARDA DE DADOS: se a linha contém dados militares reais, nunca absorver no cabeçalho.
+        // Verifica o texto de cada PhraseBlock individualmente (não o concatenado do segmento inteiro,
+        // que pode ter âncoras de outras linhas e enganar o isTableHeader).
+        const nextLineRawText = nextLine.map(p => p.text.replace(/\*\*/g, '')).join(" ");
+        const isDataLine =
+          /\bRG[\s:]*\d/i.test(nextLineRawText) ||
+          /Id\s*Funcional\s*\d/i.test(nextLineRawText) ||
+          /,\s*RG\b/i.test(nextLineRawText) ||
+          /\bRG\s*\d/i.test(nextLineRawText) ||
+          // Posto militar seguido de nome em CAIXA ALTA (ex: "3º Sgt BM Q02/08 ANDRE")
+          /\b(Ten\s+Cel|Subten|[123][°º]\s*Sgt|[12][°º]\s*Ten|Cel\s+BM|Maj\s+BM|Cap\s+BM|Sgt\s+BM|Cb\s+BM|Sd\s+BM)\b.*[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{3,}/i.test(nextLineRawText);
+        if (isDataLine) break;
+
         const nextIsHeader = isTableHeader(nextText);
         // Fragmentos de cabeçalho (ex: "NAL", "GRAD", "OBM") que vêm logo abaixo são absorvidos
         const nextIsFragment = nextLine.length <= 2 && nextText.length < 15 && !/\d/.test(nextText);
         
-        if ((nextIsHeader || nextIsFragment) && dist < 20) {
+        if ((nextIsHeader || nextIsFragment) && dist < 60) {
+          // Registra os Y das linhas absorvidas no super-header (secundárias)
+          for (const np of nextLine) {
+            superHeaderYValues.add(Math.round(np.y));
+            absorbedHeaderYValues.add(Math.round(np.y));
+          }
           // Unir frases, evitando duplicatas semânticas
           for (const np of nextLine) {
             if (!superHeader.some(sp => sp.text.toUpperCase() === np.text.toUpperCase())) {
               superHeader.push(np);
             }
           }
+          lastAbsorbedY = nextLine[0].y;
           i = nextIdx; // Avança o loop principal
           nextIdx++;
         } else {
@@ -641,6 +715,11 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     return { rows: [], columnCount: 0, rowCount: 0 };
   }
 
+  // Preserva o templateLine original (antes de qualquer transformação) para que
+  // templateHasNonStandardLabels use o cabeçalho real da tabela — não o reconstruído
+  // pelo FORCE MILITARY STRUCTURE ou pelo modo autoritativo.
+  const originalTemplateLine = [...templateLine];
+
   // FORCE MILITARY STRUCTURE: Se temos QTD/NOME mas menos que 6 colas, 
   // tentamos uma última explosão no super-header.
   const fullText = templateLine.map(p => p.text).join(" ").toUpperCase();
@@ -652,6 +731,7 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
       { key: "NOME", label: "**NOME**" },
       { key: "RG", label: "**RG**" },
       { key: "FUNCIONAL", label: "**ID FUNCIONAL**" },
+      { key: "SEI", label: "**SEI (SOLICITAÇÃO)**" },
       { key: "OBM", label: "**OBM**" }
     ];
     const recovered: PhraseBlock[] = [];
@@ -721,14 +801,16 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     const cached = refPage > 0 ? tableRegistry.lookup(refPage, "MILITARY_PERSONNEL") : null;
     if (cached && cached.length >= 3) {
       console.log(`[TableReconstructor] Registry hit: usando ${cached.length} boundaries da página ${refPage}`);
-      return { boundaries: cached, sampledLines: 0, confidence: 1.0 };
+      return { boundaries: cached, sampledLines: 0, confidence: 1.0, fromRegistry: true };
     }
-    return inferColumnBoundaries(dataOnlyTokens);
+    return { ...inferColumnBoundaries(dataOnlyTokens), fromRegistry: false };
   })();
 
   // MODO AUTORITATIVO: PatternAnalyzer detectou mais colunas que o templateLine
-  // (cabeçalho empilhado mal explodido). Usa as boundaries dos dados como fonte de verdade
-  // e reconstrói o templateLine com os labels corretos.
+  // (cabeçalho empilhado mal explodido), OU o super-header foi detectado e o
+  // PatternAnalyzer tem confiança alta (cabeçalho físico desfigurado mesmo com
+  // contagem de colunas igual — ex: COESCI página 10 onde FORCE MILITARY STRUCTURE
+  // já produziu 6 entradas mas os PhraseBlocks originais ainda estão desfigurados).
   const COLUMN_LABEL_MAP: Record<string, string> = {
     "QTD": "**QTD**",
     "POSTO/GRAD.": "**POSTO/GRAD.**",
@@ -737,12 +819,31 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     "ID FUNCIONAL": "**ID FUNCIONAL**",
     "OBM": "**OBM**",
   };
-  if (
+  let authoritativeMode = false;
+  // Colunas do vocabulário padrão militar — se o templateLine contém labels FORA
+  // deste conjunto, o cabeçalho é específico da tabela e não deve ser substituído.
+  const STANDARD_MILITARY_LABELS = new Set(["QTD", "POSTO", "GRAD", "NOME", "RG", "ID", "FUNCIONAL", "OBM", "N", "Nº", "ORDEM"]);
+  const templateHasNonStandardLabels = originalTemplateLine.some(p => {
+    const words = p.text.replace(/\*\*/g, "").toUpperCase().split(/[\s/.()+]+/).filter(Boolean);
+    return words.some(w => w.length >= 3 && !STANDARD_MILITARY_LABELS.has(w));
+  });
+
+  const shouldActivateAuthoritative =
+    // Nunca ativa modo autoritativo quando as boundaries vieram do Registry —
+    // o Registry garante consistência de posicionamento entre páginas, mas o
+    // templateLine original (cabeçalho real da tabela) é a fonte de verdade para labels.
+    !patternAnalysis.fromRegistry &&
     patternAnalysis.confidence >= 0.8 &&
-    patternAnalysis.boundaries.length > templateLine.length
-  ) {
+    patternAnalysis.boundaries.length >= 2 &&
+    // Não substitui cabeçalhos que contêm colunas específicas fora do vocabulário
+    // militar padrão (ex: SEI, SOLICITAÇÃO, Or., SAI, ENTRA) — esses são cabeçalhos
+    // reais da tabela, não artefatos de empilhamento de PDF.
+    !templateHasNonStandardLabels &&
+    // SÓ ativa quando o super-header físico foi detectado (linhas Y registradas).
+    superHeaderYValues.size > 0;
+  if (shouldActivateAuthoritative) {
     console.log(
-      `[TableReconstructor] PatternAnalyzer autoritativo: ${patternAnalysis.boundaries.length} colunas > templateLine ${templateLine.length} — reconstruindo templateLine`
+      `[TableReconstructor] PatternAnalyzer autoritativo: ${patternAnalysis.boundaries.length} colunas, templateLine ${templateLine.length}, superHeaderYs=${superHeaderYValues.size} — reconstruindo templateLine`
     );
     // Substitui o templateLine pelas boundaries dos dados
     templateLine = patternAnalysis.boundaries.map(b => ({
@@ -753,6 +854,7 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
       text: COLUMN_LABEL_MAP[b.label] ?? `**${b.label}**`,
       tokens: [],
     }));
+    authoritativeMode = true;
   }
 
   const columnCount = templateLine.length;
@@ -760,7 +862,23 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
 
   const usePatternBoundaries =
     patternAnalysis.confidence >= 0.5 &&
-    patternAnalysis.boundaries.length >= columnCount - 1;
+    // Só usa boundaries do PatternAnalyzer quando ele detectou pelo menos tantas
+    // colunas quanto o templateLine. Se detectou menos, o fallback geométrico
+    // (baseado nas posições físicas do cabeçalho) é mais confiável para as colunas extras.
+    patternAnalysis.boundaries.length >= columnCount &&
+    // Não usa boundaries do PatternAnalyzer quando o cabeçalho original tem colunas
+    // específicas da tabela (ex: SEI, SOLICITAÇÃO, Or.) — o PatternAnalyzer só conhece
+    // o vocabulário militar padrão e produziria boundaries erradas para essas colunas.
+    !templateHasNonStandardLabels;
+
+  // Modo híbrido: quando há colunas não-padrão, usa PatternAnalyzer para colunas
+  // que ele conhece (NOME, RG, ID FUNCIONAL) e fallback geométrico para as demais.
+  // Isso resolve o caso onde NOME/RG/ID chegam como token único no cabeçalho empilhado.
+  const useHybridBoundaries =
+    !usePatternBoundaries &&
+    templateHasNonStandardLabels &&
+    patternAnalysis.confidence >= 0.5 &&
+    patternAnalysis.boundaries.length >= 2;
 
   if (usePatternBoundaries) {
     console.log(`[TableReconstructor] Usando boundaries do PatternAnalyzer (confiança=${patternAnalysis.confidence.toFixed(2)})`);
@@ -772,10 +890,50 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         return hText.includes(bl.split("/")[0]) || hText.includes(bl.split(".")[0]);
       });
       const xStart = i === 0 ? 0 : columnDef[i - 1].xEnd;
-      const xEnd = matchedBoundary
+      let xEnd = matchedBoundary
         ? matchedBoundary.xEnd
         : (i < columnCount - 1 ? (templateLine[i + 1].xLeft + p.xRight) / 2 : 1500);
+      // Garante que xEnd não ultrapassa o xLeft da próxima coluna do templateLine.
+      if (i < columnCount - 1) {
+        const nextColXLeft = templateLine[i + 1].xLeft;
+        if (nextColXLeft > xStart + 5) {
+          xEnd = Math.min(xEnd, nextColXLeft);
+        }
+      }
       const centerX = matchedBoundary ? matchedBoundary.centerX : (p.xLeft + p.xRight) / 2;
+      columnDef.push({ xStart, xEnd, centerX, originalHeader: p.text });
+    }
+  } else if (useHybridBoundaries) {
+    console.log(`[TableReconstructor] Modo híbrido: PatternAnalyzer para colunas padrão, fallback geométrico para não-padrão`);
+    for (let i = 0; i < columnCount; i++) {
+      const p = templateLine[i];
+      const hText = p.text.replace(/\*\*/g, "").toUpperCase();
+      const matchedBoundary = patternAnalysis.boundaries.find(b => {
+        const bl = b.label.toUpperCase();
+        // Nº/N° é número de ordem → QTD
+        if (/^N[°º.]?$/.test(hText) && bl === "QTD") return true;
+        // MILITAR abrange posto+nome — usa boundary de NOME (mais à direita) para xEnd
+        if (hText.includes("MILITAR") && bl === "NOME") return true;
+        return hText.includes(bl.split("/")[0]) || hText.includes(bl.split(".")[0]);
+      });
+      const xStart = i === 0 ? 0 : columnDef[i - 1].xEnd;
+      let xEnd: number;
+      let centerX: number;
+      if (matchedBoundary) {
+        // Garante que xEnd nunca fique à esquerda de xStart (boundary invertida)
+        xEnd = Math.max(matchedBoundary.xEnd, xStart + 10);
+        centerX = matchedBoundary.centerX;
+      } else {
+        xEnd = i < columnCount - 1 ? templateLine[i + 1].xLeft : 1500;
+        centerX = (p.xLeft + p.xRight) / 2;
+      }
+      if (i < columnCount - 1) {
+        const nextColXLeft = templateLine[i + 1].xLeft;
+        if (nextColXLeft > xStart + 5) {
+          xEnd = Math.min(xEnd, nextColXLeft + 15);
+        }
+      }
+      console.log(`[Híbrido] col=${i} "${hText.substring(0,20)}" xStart=${Math.round(xStart)} xEnd=${Math.round(xEnd)} center=${Math.round(centerX)} templateXLeft=${Math.round(p.xLeft)}`);
       columnDef.push({ xStart, xEnd, centerX, originalHeader: p.text });
     }
   } else {
@@ -814,6 +972,11 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
             if (nextHType.includes("RG") || nextHType.includes("ID")) bias = Math.min(bias, 0.4);
             xEnd = p.xRight + gap * bias;
           }
+          // Usa o xLeft da próxima coluna como limite superior sempre que disponível
+          // (cobre tanto PhraseBlocks com tokens físicos quanto os criados por fallback proporcional).
+          if (next.xLeft > xStart + 5) {
+            xEnd = Math.min(xEnd, next.xLeft);
+          }
         }
       }
 
@@ -825,8 +988,82 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
   const finalRows: TableCell[][] = [];
   const normalizedHeaderStrings = templateLine.map(p => normalizeTitle(p.text));
 
+  // MODO AUTORITATIVO: injeta row sintética de cabeçalho com os labels corretos
+  // e pula as linhas físicas do super-header original (que têm PhraseBlocks desfigurados).
+  if (authoritativeMode) {
+    const syntheticHeaderRow: TableCell[] = templateLine.map((p, c) => ({
+      text: p.text,
+      tokens: [],
+      row: 0,
+      col: c,
+      rowSpan: 1,
+      colSpan: 1,
+      align: 'center' as const,
+    }));
+    finalRows.push(syntheticHeaderRow);
+    console.log(`[TableReconstructor] Modo autoritativo: injetando cabeçalho sintético com ${templateLine.length} colunas, pulando ${superHeaderYValues.size} Y(s) do super-header original`);
+  }
+
   for (let i = 0; i < allLinesPhrases.length; i++) {
     const linePhrases = allLinesPhrases[i];
+
+    // Pula linhas físicas SECUNDÁRIAS do super-header (absorvidas na agregação).
+    // A linha principal do template é processada normalmente como row de cabeçalho.
+    // Isso evita que a linha 2 do cabeçalho empilhado seja tratada como dado ou "repeated header".
+    if (linePhrases.length > 0 && absorbedHeaderYValues.size > 0) {
+      const lineY = Math.round(linePhrases[0].y);
+      const isAbsorbedLine = Array.from(absorbedHeaderYValues).some(hy => Math.abs(lineY - hy) <= 5);
+      if (isAbsorbedLine) {
+        continue;
+      }
+    }
+
+    // MODO AUTORITATIVO: pula linhas físicas que fazem parte do super-header original
+    if (authoritativeMode && linePhrases.length > 0) {
+      const lineY = Math.round(linePhrases[0].y);
+      const isSuperHeaderLine = Array.from(superHeaderYValues).some(hy => Math.abs(lineY - hy) <= 5);
+      if (isSuperHeaderLine) {
+        console.log(`[TableReconstructor] Pulando linha do super-header original y=${lineY}`);
+        continue;
+      }
+    }
+
+    // SUBSTITUIÇÃO DO CABEÇALHO: quando a linha física é o cabeçalho principal
+    // (Y em superHeaderYValues mas não em absorbedHeaderYValues, e é a primeira row),
+    // injeta diretamente o templateLine como row de cabeçalho — sem passar pelo motor
+    // de overlap, que pode errar quando os PhraseBlocks têm posições proporcionais.
+    let effectivePhrases = linePhrases;
+    let useDirectHeaderInjection = false;
+    if (linePhrases.length > 0 && superHeaderYValues.size > 0 && finalRows.length === 0) {
+      const lineY = Math.round(linePhrases[0].y);
+      // Tolerância aumentada para 20px — o Y do PhraseBlock pode diferir do Y da linha física
+      // por causa do histograma de agrupamento no rawLines (Y_BUCKET_SIZE=1, centro de massa).
+      const isPrimaryHeaderByY = Array.from(superHeaderYValues).some(hy => Math.abs(lineY - hy) <= 20)
+        && !Array.from(absorbedHeaderYValues).some(hy => Math.abs(lineY - hy) <= 5);
+      // Fallback por texto: se a linha é cabeçalho puro (sem dados militares) e é a primeira row
+      const lineRawForHeader = linePhrases.map(p => p.text.replace(/\*\*/g, '')).join(" ");
+      const lineIsHeaderText = isTableHeader(linePhrases.map(p => p.text).join(" ").toUpperCase());
+      const lineHasDataForHeader =
+        /\bRG[\s:]*\d/i.test(lineRawForHeader) ||
+        /Id\s*Funcional\s*\d/i.test(lineRawForHeader) ||
+        /,\s*RG\b/i.test(lineRawForHeader) ||
+        /\b(Ten\s+Cel|Subten|[123][°º]\s*Sgt|[12][°º]\s*Ten|Cel\s+BM|Maj\s+BM|Cap\s+BM|Sgt\s+BM|Cb\s+BM|Sd\s+BM)\b.*[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{3,}/i.test(lineRawForHeader);
+      const isPrimaryHeader = isPrimaryHeaderByY || (lineIsHeaderText && !lineHasDataForHeader);
+      if (isPrimaryHeader) {
+        // Injeta o templateLine diretamente como row de cabeçalho
+        const headerRow: TableCell[] = templateLine.map((p, c) => ({
+          text: p.text,
+          tokens: p.tokens,
+          row: 0,
+          col: c,
+          rowSpan: 1,
+          colSpan: 1,
+          align: 'center' as const,
+        }));
+        finalRows.push(headerRow);
+        continue;
+      }
+    }
     
     // SKIP REPEATED HEADERS: Se a linha atual é identica ao template (exceto pela 1ª ocorrência), ignora.
     if (finalRows.length > 0) {
@@ -852,16 +1089,20 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
       align: 'left' // default
     }));
 
-    for (const p of linePhrases) {
+    for (const p of effectivePhrases) {
       // Find the best matching column for this phrase
       let bestCol = -1;
       let minDistance = 1000;
+
+      // LOG DIAGNÓSTICO para token 043408354
+      const _isDiag = /^043408354/.test(p.text.replace(/\*\*/g,''));
+      if (_isDiag) console.log(`[DIAG-043] phrase="${p.text.substring(0,40)}" xLeft=${Math.round(p.xLeft)} xRight=${Math.round(p.xRight)}`);
 
       for (let c = 0; c < columnCount; c++) {
         const def = columnDef[c];
         const overlap = Math.max(0, Math.min(p.xRight, def.xEnd) - Math.max(p.xLeft, def.xStart));
         const phraseWidth = p.xRight - p.xLeft;
-        
+
         // --- MOTOR SEMÂNTICO (Unified Brain v5) ---
         const hType = def.originalHeader.replace(/\*\*/g, '').toUpperCase();
         const score = getSemanticScore(p.text, hType);
@@ -878,17 +1119,35 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         if (isNameFragment && isNomeCol) threshold = 0.05;
 
         if (overlap > phraseWidth * threshold) {
-          bestCol = c;
-          // Se o dado encaixa perfeitamente na coluna atual, para aqui para evitar vazamento
-          // para a coluna seguinte (ex: Nome vazando para RG)
+          // Escolhe a coluna com maior overlap (não apenas a última com overlap suficiente)
+          const prevOverlap = bestCol >= 0
+            ? Math.max(0, Math.min(p.xRight, columnDef[bestCol].xEnd) - Math.max(p.xLeft, columnDef[bestCol].xStart))
+            : -1;
+          if (overlap > prevOverlap) {
+            bestCol = c;
+          }
+          // Se o dado encaixa perfeitamente na coluna atual, para aqui
           if (score >= 1 || (isNameFragment && isNomeCol)) break;
+        } else if (bestCol === -1) {
+          // Distance to center como fallback — só quando nenhum overlap foi encontrado ainda
+          const dist = Math.abs((p.xLeft + phraseWidth / 2) - def.centerX);
+          if (dist < minDistance) {
+            minDistance = dist;
+            bestCol = c;
+          }
         }
+      }
 
-        // Distance to center as fallback
-        const dist = Math.abs((p.xLeft + phraseWidth / 2) - def.centerX);
-        if (dist < minDistance) {
-          minDistance = dist;
-          bestCol = c;
+      // Se nenhum overlap encontrou bestCol, usa distância ao centro como último recurso
+      if (bestCol === -1) {
+        for (let c = 0; c < columnCount; c++) {
+          const def = columnDef[c];
+          const phraseWidth = p.xRight - p.xLeft;
+          const dist = Math.abs((p.xLeft + phraseWidth / 2) - def.centerX);
+          if (dist < minDistance) {
+            minDistance = dist;
+            bestCol = c;
+          }
         }
       }
 
@@ -914,6 +1173,8 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         const cell = rowCells[bestCol];
         const phraseWidth = p.xRight - p.xLeft;
         const phraseCenterX = p.xLeft + phraseWidth / 2;
+
+        if (_isDiag) console.log(`[DIAG-043] → bestCol=${bestCol} header="${columnDef[bestCol]?.originalHeader}" xStart=${Math.round(columnDef[bestCol]?.xStart)} xEnd=${Math.round(columnDef[bestCol]?.xEnd)}`);
         const colInfo = columnDef[bestCol];
         const colWidth = colInfo.xEnd - colInfo.xStart;
 
@@ -924,7 +1185,12 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
 
         cell.text = (cell.text + " " + p.text).trim();
         cell.tokens.push(...p.tokens);
-      }
+
+        // LOG DIAGNÓSTICO: detecta concatenação dupla na coluna NOME
+        const _hTypeDiag = columnDef[bestCol].originalHeader.replace(/\*\*/g, '').toUpperCase();
+        if (_hTypeDiag.includes('NOME') && /ANTONIO|AMBROSIO|EDISON/i.test(p.text)) {
+          console.log(`[Passo5][DIAG2] y=${Math.round(linePhrases[0]?.y ?? 0)} col=${bestCol} phrase="${p.text.substring(0,40)}" cellBefore="${cell.text.replace(p.text,'').trim().substring(0,30)}"`);
+        }      }
     }
 
     finalRows.push(rowCells);
@@ -960,15 +1226,34 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
     }
 
     // Sem colisão → merge normal (preenche células vazias)
-    // EXCEÇÃO: se a linha atual tem apenas NOME preenchido com nome próprio em CAIXA ALTA
+    // EXCEÇÃO 1: se a linha atual tem apenas NOME preenchido com nome próprio em CAIXA ALTA
     // e a linha anterior já tem NOME preenchido, é um novo militar — não faz merge.
+    // EXCEÇÃO 2: se a linha atual E a anterior têm POSTO/GRAD com posto militar válido,
+    // é sempre um novo militar — nunca faz merge com a linha anterior.
+    // (Se só a linha atual tem POSTO mas a anterior não, é linha B do mesmo militar → merge normal)
     if (collisionCols === 0) {
-      const nomeColIdx = columnDef.findIndex(d => d.originalHeader.replace(/\*\*/g, '').toUpperCase().includes('NOME'));
+      const postoColIdx = columnDef.findIndex(d => /POSTO|GRAD/.test(d.originalHeader.replace(/\*\*/g, '').toUpperCase()));
+      const nomeColIdx  = columnDef.findIndex(d => d.originalHeader.replace(/\*\*/g, '').toUpperCase().includes('NOME'));
+      // Exceção 2: linha atual começa com posto militar → novo militar
+      // MAS só se a linha anterior já tem POSTO preenchido (ou seja, é realmente um novo militar).
+      // Se a anterior não tem POSTO, a linha atual é a linha B (continuação) do mesmo militar.
+      if (postoColIdx >= 0) {
+        const currPosto = currentRow[postoColIdx]?.text.replace(/\*\*/g, '').trim() ?? '';
+        const lastPosto = lastRow[postoColIdx]?.text.replace(/\*\*/g, '').trim() ?? '';
+        const isMilitary = (s: string) => /^(Al\s+Sd|Ten\s+Cel|TC|Subten|ST|[123][º°o]\s*Sgt|[12][º°o]\s*Ten|Gen|Cel|Maj|Cap|Sgt|Cb|Sd)\b/i.test(s);
+        if (isMilitary(currPosto) && isMilitary(lastPosto)) {
+          mergedRows.push(currentRow);
+          continue;
+        }
+      }
+
+      // Exceção 1: linha atual tem só NOME em CAIXA ALTA e anterior já tem NOME
       if (nomeColIdx >= 0) {
         const currNome = currentRow[nomeColIdx]?.text.trim() ?? '';
         const lastNome = lastRow[nomeColIdx]?.text.trim() ?? '';
+        const currNomePlain = currNome.replace(/\*\*/g, '').trim();
         const currOnlyNome = currFilled === 1 && currentRow[nomeColIdx]?.text.length > 0;
-        const currIsFullName = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,}(\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,})+$/.test(currNome);
+        const currIsFullName = /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,}(\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,})+$/.test(currNomePlain);
         if (currOnlyNome && currIsFullName && lastNome.length > 0) {
           mergedRows.push(currentRow);
           continue;
@@ -981,6 +1266,19 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         }
       }
       continue;
+    }
+
+    // Com colisão: antes de avaliar continuação, verifica se a linha atual
+    // tem posto militar válido na coluna POSTO/GRAD — se sim, é sempre novo militar.
+    {
+      const postoColIdx = columnDef.findIndex(d => /POSTO|GRAD/.test(d.originalHeader.replace(/\*\*/g, '').toUpperCase()));
+      if (postoColIdx >= 0) {
+        const currPosto = currentRow[postoColIdx]?.text.replace(/\*\*/g, '').trim() ?? '';
+        if (currPosto && /^(Al\s+Sd|Ten\s+Cel|TC|Subten|ST|[123][º°o]\s*Sgt|[12][º°o]\s*Ten|Gen|Cel|Maj|Cap|Sgt|Cb|Sd)\b/i.test(currPosto)) {
+          mergedRows.push(currentRow);
+          continue;
+        }
+      }
     }
 
     // Com colisão: verifica se o row atual é uma continuação de célula quebrada.
@@ -999,7 +1297,13 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
         if (/^\d[\d.\s]*$/.test(t)) return true;
 
         // Caso 2: texto curto sem vírgula (ex: fragmento de horário, OBM)
-        if (t.length < 30 && !/,/.test(t) && isNameOrObm) return true;
+        // Exceção: nome próprio completo em CAIXA ALTA na coluna NOME com 2+ palavras
+        // é novo militar, não continuação (ex: "ANTONIO MARCOS AMBROSIO DOS")
+        const tPlain = t.replace(/\*\*/g, '').trim(); // remove bold markers para comparação
+        const isFullNameInNomeCol = hType.includes("NOME") &&
+          /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,}(\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,})+$/.test(tPlain) &&
+          tPlain.split(/\s+/).length >= 2;
+        if (t.length < 30 && !/,/.test(t) && isNameOrObm && !isFullNameInNomeCol) return true;
 
         // Caso 3: continuação de texto descritivo — linha atual começa com minúscula
         // ou com preposição/artigo (ex: "e Reciclagem de Motoristas")
@@ -1012,18 +1316,18 @@ export const reconstructTableByTemplate = (tokens: TextToken[]): TableData => {
 
         // Caso 6: GRAVIDADE SEMÂNTICA (Unified Brain v5)
         // Se o fragmento combina semânticamente com a coluna (especialmente NOME/OBM)
+        // Exceção: nome completo em CAIXA ALTA na coluna NOME é novo militar, não continuação
         const score = getSemanticScore(t, hType);
-        if (score >= 0.8 && (hType.includes("NOME") || hType.includes("OBM"))) return true;
+        if (score >= 0.8 && (hType.includes("NOME") || hType.includes("OBM")) && !isFullNameInNomeCol) return true;
 
         // Caso 7: linha anterior não termina com pontuação forte...
         const prevEndsClean = !/[.;!?]$/.test(prev);
         // Nova entrada: começa com posto/graduação militar OU número de item de lista
         // OU nome próprio em CAIXA ALTA completo na coluna NOME (novo militar)
+        // Usa tPlain (sem bold markers) para o teste de nome completo
         const currIsNewEntry = /^(Cap|Ten|Cel|Maj|Sgt|Cb|Sd|BM)\s/i.test(t) ||
                                /^\d+[.)]\s/.test(t) ||
-                               (isNameOrObm && hType.includes("NOME") &&
-                                /^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,}(\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]{2,})+$/.test(t) &&
-                                t.split(/\s+/).length >= 2);
+                               (isNameOrObm && hType.includes("NOME") && isFullNameInNomeCol);
         if (prevEndsClean && !currIsNewEntry && t.length < 80) return true;
 
         return false;

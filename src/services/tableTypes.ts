@@ -102,14 +102,18 @@ export const COLUMN_VALIDATION_PATTERNS: Record<string, RegExp> = {
   // POSTO/GRAD.: aceita posto isolado ou posto + quadro/ano (ex: "Maj BM QOC/09")
   "POSTO/GRAD":   MILITARY_RANK_RE,
   "NOME":         /^[A-ZÀ-Ú\s.\-'/]+$/i,
-  "RG":           /^\d{1,2}\.\d{3}$/,
-  "ID FUNCIONAL": /^\d{7,10}$/,
-  "FUNCIONAL":    /^\d{7,10}$/,
-  "OBM":          /GBM|GMar|DBM|CER|ABMDP|\d+[º°]\s*G[BM]|BM\/\d+/i,
+  // RG: formato NN.NNN — aceita mesmo com bold markers ou sobrenome colado
+  "RG":           /\d{1,2}\.\d{3}/,
+  "ID FUNCIONAL": /\d{7,10}/,
+  "FUNCIONAL":    /\d{7,10}/,
+  // OBM/UNIDADE: qualquer texto não-vazio — unidades do CBMERJ têm nomes variados
+  "OBM":          /\S/,
+  "UNIDADE":      /\S/,
+  // MILITAR: posto+nome completo (pode conter RG, Id Funcional embutidos)
+  "MILITAR":      /\S/,
   "GRAD/QBMP":    MILITARY_RANK_RE,
   "INSP":         /^(Apto|Inapto|Dispensado|Apto\s+com)/i,
   "FISCAL":       /^[A-ZÀ-Ú\s]+$/i,
-  "UNIDADE":      /GBM|GMar|DBM|CER|\d+[º°]/i,
 };
 
 // ─── Score semântico por tipo de coluna ─────────────────────────────────────

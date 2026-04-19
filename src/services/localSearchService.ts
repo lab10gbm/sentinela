@@ -245,8 +245,8 @@ export const matchPersonnelInBlock = (
   lines: string[],
   personnel: MilitaryPerson[],
   prefs: SearchPreferences
-): { name: string, confidence: 'High' | 'Medium' | 'Low' }[] => {
-  const found: { name: string, confidence: 'High' | 'Medium' | 'Low' }[] = [];
+): { name: string, confidence: 'High' | 'Medium' | 'Low', matchedBy: 'RG' | 'ID Funcional' | 'Nome' }[] => {
+  const found: { name: string, confidence: 'High' | 'Medium' | 'Low', matchedBy: 'RG' | 'ID Funcional' | 'Nome' }[] = [];
 
   for (const person of personnel) {
     const cleanId = person.idFuncional ? person.idFuncional.replace(/[^0-9]/g, '').replace(/^0+/, '') : null;
@@ -256,7 +256,8 @@ export const matchPersonnelInBlock = (
       : [];
 
     let hasName = false;
-    let hasNumber = false;
+    let matchedById = false;
+    let matchedByRg = false;
 
     for (const line of lines) {
       const lineNorm = normalizeSimple(line);
@@ -269,22 +270,23 @@ export const matchPersonnelInBlock = (
       }
 
       // Estágio 2: RG ou ID Funcional
-      if (!hasNumber) {
-        if (
-          (prefs.useRg && hasConfirmingNumber(line, cleanRg, null)) ||
-          (prefs.useIdFuncional && hasConfirmingNumber(line, null, cleanId))
-        ) {
-          hasNumber = true;
-        }
+      if (!matchedByRg && prefs.useRg && hasConfirmingNumber(line, cleanRg, null)) {
+        matchedByRg = true;
+      }
+      if (!matchedById && prefs.useIdFuncional && hasConfirmingNumber(line, null, cleanId)) {
+        matchedById = true;
       }
 
-      if (hasName && hasNumber) break;
+      if (hasName && (matchedByRg || matchedById)) break;
     }
+
+    const hasNumber = matchedByRg || matchedById;
 
     // Só confirma se tiver número (RG ou ID). Nome sozinho não é suficiente.
     if (hasNumber) {
-      const confidence = hasName ? 'High' : 'Medium'; // com nome = High, só número = Medium
-      found.push({ name: person.nomeCompleto, confidence });
+      const confidence = hasName ? 'High' : 'Medium';
+      const matchedBy: 'RG' | 'ID Funcional' | 'Nome' = matchedById ? 'ID Funcional' : 'RG';
+      found.push({ name: person.nomeCompleto, confidence, matchedBy });
     }
   }
 

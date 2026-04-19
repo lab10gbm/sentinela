@@ -122,6 +122,58 @@ const overallScore = (validations: ColumnValidation[]): number =>
 // aparecem depois que as células são montadas (ex: OBM multiline).
 
 /**
+ * Detecta e corrige rows[0] misto: quando o cabeçalho e a primeira linha de dados
+ * foram fundidos na mesma célula (ex: "MILITAR 3º Sgt BM Q02/08 ANDRE...").
+ * Separa o label do cabeçalho dos dados do primeiro militar.
+ */
+const splitMixedHeaderRow = (data: TableData, corrections: string[]): TableData => {
+  if (data.rows.length < 1) return data;
+
+  const headerRow = data.rows[0];
+  // Procura coluna MILITAR/NOME com dados militares reais embutidos
+  const militarColIdx = headerRow.findIndex(c => {
+    const plain = c.text.replace(/\*\*/g, '').trim();
+    // Cabeçalho puro: só "MILITAR" ou "NOME" sem dados
+    if (/^(MILITAR|NOME|POSTO\/GRAD|GRADUAÇÃO)$/i.test(plain)) return false;
+    // Misto: começa com label de cabeçalho seguido de dados militares
+    return /^(MILITAR|NOME)\s+.*(RG\s*\d|Id\s*Funcional\s*\d|[123][°º]\s*Sgt|Subten|Cap\s+BM|Maj\s+BM|Cel\s+BM)/i.test(plain);
+  });
+
+  if (militarColIdx < 0) return data;
+
+  const mixedCell = headerRow[militarColIdx];
+  const mixedText = mixedCell.text.replace(/\*\*/g, '').trim();
+
+  // Extrai o label (primeira palavra: MILITAR ou NOME) e os dados (resto)
+  const labelMatch = mixedText.match(/^(MILITAR|NOME)\s+(.+)$/is);
+  if (!labelMatch) return data;
+
+  const label = labelMatch[1];
+  const dataText = labelMatch[2].trim();
+
+  // Reconstrói o cabeçalho com só o label
+  const cleanHeader = headerRow.map((c, ci) =>
+    ci === militarColIdx ? { ...c, text: `**${label}**` } : c
+  );
+
+  // Cria nova linha de dados com o texto extraído
+  const newDataRow: typeof headerRow = headerRow.map((c, ci) => ({
+    ...c,
+    text: ci === militarColIdx ? dataText : '',
+    tokens: ci === militarColIdx ? mixedCell.tokens : [],
+    row: 1,
+  }));
+
+  corrections.push(`splitMixedHeaderRow: separou "${label}" de "${dataText.substring(0, 40)}..."`);
+
+  const newRows = [cleanHeader, newDataRow, ...data.rows.slice(1).map((r, i) =>
+    r.map(c => ({ ...c, row: c.row + 1 }))
+  )];
+
+  return { ...data, rows: newRows, rowCount: newRows.length };
+};
+
+/**
  * Merge de OBM multiline: célula OBM vazia + linha seguinte com só OBM → absorve.
  * Não duplica o merge multirow do TableReconstructor (que opera por Y-gap);
  * este opera sobre o resultado final já montado.
@@ -136,6 +188,37 @@ const mergeObmMultiline = (data: TableData, corrections: string[]): TableData =>
     h => h.includes("OBM") || h.includes("DBM") || h.includes("GBM")
   );
   if (obmCol < 0) return data;
+
+  // Caso especial: cabeçalho OBM contém o nome da unidade embutido
+  // (ex: "OBM CTRM - Centro de Treinamento") — extrai e move para a 1ª linha de dados
+  const headerOBMText = data.rows[0][obmCol]?.text ?? "";
+  const headerOBMPlain = headerOBMText.replace(/\*\*/g, "").trim();
+  const OBM_HEADER_LABELS = /^(OBM|DBM|GBM)\b/i;
+  if (OBM_HEADER_LABELS.test(headerOBMPlain) && headerOBMPlain.length > 3) {
+    const embeddedValue = headerOBMPlain.replace(/^(OBM|DBM|GBM)\s*/i, "").trim();
+    if (embeddedValue.length > 0) {
+      // Limpa o cabeçalho para só "OBM" e injeta o valor na 1ª linha de dados com OBM vazia
+      const cleanedHeader = data.rows[0].map((c, ci) =>
+        ci === obmCol ? { ...c, text: headerOBMText.replace(/\*\*/g, "").trim().split(/\s+/)[0] } : c
+      );
+      const newRows: TableCell[][] = [cleanedHeader];
+      let injected = false;
+      for (let i = 1; i < data.rows.length; i++) {
+        const row = data.rows[i];
+        if (!injected && (row[obmCol]?.text.trim() === "" || !row[obmCol]?.text)) {
+          const merged = row.map((c, ci) =>
+            ci === obmCol ? { ...c, text: embeddedValue } : c
+          );
+          corrections.push(`OBM do cabeçalho movida para linha ${i}: "${embeddedValue}"`);
+          newRows.push(merged);
+          injected = true;
+        } else {
+          newRows.push(row);
+        }
+      }
+      data = { ...data, rows: newRows, rowCount: newRows.length };
+    }
+  }
 
   const newRows: TableCell[][] = [data.rows[0]];
   let i = 1;
@@ -225,6 +308,11 @@ export const validateAndReconstruct = (
   const tableType = classifyTableType(tokens);
   const strategies = RETRY_ORDER[tableType];
 
+  // Detecta o número de colunas esperado pelo cabeçalho (templateLine do AUTO).
+  // Usado para penalizar estratégias que produzem número diferente de colunas.
+  // Só aplica quando AUTO produz um resultado com cabeçalho reconhecível.
+  let expectedColumnCount = 0;
+
   let bestData: TableData = { rows: [], columnCount: 0, rowCount: 0 };
   let bestScore = -1;
   let bestStrategy: Strategy = "AUTO";
@@ -233,10 +321,23 @@ export const validateAndReconstruct = (
   for (const strategy of strategies) {
     let data = runStrategy(strategy, tokens);
     data = normalizeCells(data);
+    data = splitMixedHeaderRow(data, corrections);
     data = mergeObmMultiline(data, corrections);
 
     const validations = validateColumns(data);
-    const score = overallScore(validations);
+    let score = overallScore(validations);
+
+    // Registra o número de colunas da primeira estratégia (AUTO) como referência.
+    if (strategy === "AUTO" && data.columnCount > 0) {
+      expectedColumnCount = data.columnCount;
+    }
+
+    // Penaliza estratégias que produzem número de colunas diferente do esperado.
+    // Isso evita que BORDER (que fragmenta em 3-5 colunas) vença sobre AUTO/TEMPLATE
+    // (que produz 2 colunas corretas para tabelas MILITAR|OBM).
+    if (expectedColumnCount > 0 && data.columnCount !== expectedColumnCount) {
+      score *= 0.7; // penalidade de 30% por número de colunas divergente
+    }
 
     console.log(
       `[TableValidator] tipo=${tableType} estratégia=${strategy} score=${score.toFixed(2)} cols=${data.columnCount} rows=${data.rowCount}`
@@ -264,12 +365,13 @@ export const validateAndReconstruct = (
     console.log(`[TableValidator] Correções:`, corrections);
   }
 
-  // Salva boundaries no registry se MILITARY_PERSONNEL com score ≥ 0.9 e 6 colunas
-  if (tableType === "MILITARY_PERSONNEL" && bestScore >= 0.9 && bestData.columnCount === 6) {
+  // Salva boundaries no registry se score ≥ 0.7 e pelo menos 3 colunas detectadas
+  // (antes era só MILITARY_PERSONNEL com score ≥ 0.9 e 6 colunas)
+  if (bestScore >= 0.7 && bestData.columnCount >= 3) {
     const refPage = tokens[0]?.page ?? 0;
     if (refPage > 0) {
       const analysis = inferColumnBoundaries(tokens);
-      if (analysis.boundaries.length === 6) {
+      if (analysis.boundaries.length >= 3) {
         tableRegistry.save(refPage, tableType, analysis.boundaries);
       }
     }

@@ -736,13 +736,13 @@ export const detectLayoutSignature = (tokens: TextToken[]): { verticalAxes: numb
  */
 export const isHardLegalParagraph = (text: string): boolean => {
   const plain = text.trim().replace(/\*\*/g, '');
-  
+
   return (
-    // Título de nota ou edital (ex: "1. CURSO DE...")
-    /^\d+[.\s]+.*(CURSO|RELAÇÃO|EDITAL|NOTA|PROGRAMA|PLANO|INSCRIÇÃO|CONVOCAÇÃO|RESULTADO|GABARITO|ATA|PORTARIA|RESOLUÇÃO|DESPACHO)/i.test(plain) ||
+    // Título de nota ou edital (ex: "1. CURSO DE...") — \b evita falso positivo em "CATARINO"
+    /^\d+[.\s]+.*\b(CURSO|RELAÇÃO|EDITAL|NOTA|PROGRAMA|PLANO|INSCRIÇÃO|CONVOCAÇÃO|RESULTADO|GABARITO|ATA|PORTARIA|RESOLUÇÃO|DESPACHO)\b/i.test(plain) ||
     // Numeração hierárquica de documento (1.1., 1.1.1.)
     /^\d+\.\d+\.?\s/.test(plain) ||
-    // Fórmulas fixas de introdução militar (TORNA PÚBLICA, RESOLVE, DETERMINA)
+    // Fórmulas fixas de introdução militar
     /^\b(TORNA\s+PÚBLICA|TORNA\s+SEM\s+EFEITO|RESOLVE|DETERMINA|DESIGNA|CONCEDE|RETIFICA|ADITA|AUTORIZA|PROMOVE|INCLUI|EXCLUI|TRANSFERE|RESERVA|APOSENTA|CONVOCAR|TORNA\s+INSUFICIENTE|CONSIDERANDO)\b/i.test(plain) ||
     // Introdução de notas de instrução/curso
     /\b(relação\s+de\s+inscritos|processo\s+seletivo|à\s+saber:|conforme\s+segue\b|nos\s+termos\s+da\b|em\s+epígrafe\b|publicada\s+no\s+Boletim\b)/i.test(plain) ||
@@ -755,6 +755,9 @@ export const isHardLegalParagraph = (text: string): boolean => {
     /^Registre[-\s]se/i.test(plain) ||
     /^Publique[-\s]se/i.test(plain) ||
     /^Cumpra[-\s]se/i.test(plain) ||
+    // Observação pós-tabela
+    /^Obs[.:]/.test(plain) ||
+    /^Observa[çc][ãa]o[.:]/i.test(plain) ||
     // Autoridades e OBMs como intro
     /^\b(O\s+Cel\s+BM|O\s+Comandante|O\s+Diretor|O\s+Chefe|O\s+Subcomandante|O\s+Secretário|O\s+Estado-Maior|O\s+Cel\s+BM\s+Diretor)\b/i.test(plain) ||
     /^(GMar|GBM|DBM|CER|ABMDP|CEMAR|GBS|GSE|Primeiro\s+Grupamento|Segundo\s+Grupamento)\b/i.test(plain) && plain.length < 60 && !/\d{2}\.\d{3}/.test(plain) && !/\d+\//.test(plain) ||
@@ -768,8 +771,8 @@ export const isHardLegalParagraph = (text: string): boolean => {
     /\bnomeando\b/i.test(plain) ||
     // Linha narrativa longa terminando em ponto com múltiplas vírgulas (parágrafo)
     (plain.length > 80 && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 2) ||
-    // Linha que parece título de nota (começa com número e tem palavras de documento)
-    /^\d+[.\s]+.*(NOTA|CURSO|RELAÇÃO|LISTA|EDITAL|PROGRAMA|CRONOGRAMA|PLANO)/i.test(plain) ||
+    // Linha que parece título de nota — \b evita falso positivo em nomes
+    /^\d+[.\s]+.*\b(NOTA|CURSO|RELAÇÃO|LISTA|EDITAL|PROGRAMA|CRONOGRAMA|PLANO)\b/i.test(plain) ||
     // Referência institucional em parágrafo
     /\b(da|do|de)\s+(Diretoria|Comando|Assessoria|Corregedoria|Secretaria|Divisão|Seção)\b/i.test(plain)
   );
@@ -843,7 +846,11 @@ export const detectTableStructure = (text: string, tokens?: TextToken[]): boolea
       // Linha de portaria/designação narrativa longa que termina em ponto
       (plain.length > 80 && /,$/.test(plain.replace(/\s+$/, '')) === false && /\.$/.test(plain) && (plain.match(/,/g) || []).length >= 3) ||
       // Linha que termina em hífen (palavra quebrada) - apenas se for curta
-      (/-$/.test(plain) && plain.length < 50);
+      (/-$/.test(plain) && plain.length < 50) ||
+      // Dado de militar em texto corrido: "Cel BM QOC/96 NOME, RG 19.213, Id Funcional 123;"
+      // Padrão: vírgula + RG + número OU "Id Funcional" com número = linha narrativa, nunca tabela
+      /,\s*RG\s+\d/.test(plain) ||
+      /Id\s*Funcional\s+\d/i.test(plain);
 
     if (isDefinitelyParagraph) return false;
 
@@ -943,9 +950,28 @@ export const isTableHeader = (text: string): boolean => {
   const plain = text.replace(/\*\*/g, '').trim();
   const up = plain.toUpperCase();
 
+  // ── REJEIÇÕES PRECOCES (antes das regras de ouro) ────────────────────────
+  // Aplicadas apenas a linhas curtas — não ao texto completo de uma tabela inteira.
+  if (plain.length < 200) {
+    // Linha de dado SEI: contém número de processo SEI (ex: "SEI-270.007/013.097/2026")
+    if (/\bSEI[-\s]\d/.test(plain)) return false;
+    // Linha termina com ";" = item de lista/diretriz, nunca cabeçalho de tabela
+    if (/;\s*$/.test(plain)) return false;
+    // Subtítulo numerado: "4. Leitura das...", "1. DATA, HORA E LOCAL" — nunca cabeçalho
+    if (/^\d+[\s.)]+[A-ZÀ-ü]/.test(plain)) return false;
+    // Texto narrativo: começa com artigo/pronome seguido de minúscula (parágrafo)
+    if (/^(A |O |As |Os |Um |Uma )[a-záéíóúâêîôûãõç]/.test(plain)) return false;
+    // Contém URL = texto narrativo, nunca cabeçalho
+    if (/https?:\/\//.test(plain)) return false;
+  }
+  // RG seguido de número = dado de militar (sem limite de tamanho)
+  if (/\bRG[:\s]+\d/.test(plain)) return false;
+  // Id Funcional com número = dado de militar (sem limite de tamanho)
+  if (/Id\s*Funcional\s*\d/i.test(plain)) return false;
+
   // ── REGRA DE OURO (FORÇADA) ─────────────────────────────────────────────
   // Se contiver QTD/ORDEM e qualquer outra palavra de tabela no mesmo bloco, É cabeçalho.
-  const anchors = ["QTD", "ORDEM", "NOME", "POSTO", "GRAD", "RG", "ID", "OBM", "FUNCIONAL", "INSCRIÇÃO", "INSC", "RELAÇÃO", "INSCRITOS", "PÁG", "PAG", "MATRÍCULA", "IDENTIDADE", "CLASSIFICAÇÃO", "QUADRO", "CPF", "Nº", "N°"];
+  const anchors = ["QTD", "ORDEM", "NOME", "POSTO", "GRAD", "RG", "ID", "OBM", "FUNCIONAL", "INSCRIÇÃO", "INSC", "RELAÇÃO", "INSCRITOS", "PÁG", "PAG", "MATRÍCULA", "IDENTIDADE", "CLASSIFICAÇÃO", "QUADRO", "CPF", "Nº", "N°", "SEI", "SOLICITAÇÃO", "OR."];
   const upMatch = anchors.filter(a => up.includes(a));
   
   // Detecção de Grade Militar Típica (QTD POSTO/GRAD. NOME RG ID FUNCIONAL OBM)
@@ -985,8 +1011,6 @@ export const isTableHeader = (text: string): boolean => {
    if (/^(e |de |do |da |dos |das |no |na |nos |nas |com |para |pelo |pela )/i.test(plain)) return false;
    // Campo de formulário: "Palavra:" ou "Palavra: valor" — nunca é cabeçalho
    if (/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç\s]+:/.test(plain)) return false;
-   // RG seguido de número = dado de militar (ex: "RG 43.544")
-   if (/\bRG\s+\d/.test(plain)) return false;
    // Linha começa com horário = dado de agenda/escala (ex: "08h    ABERTURA")
    if (/^\d{1,2}[h:]\d*/.test(plain.trim())) return false;
    // Vírgula antes de RG = dado de militar
