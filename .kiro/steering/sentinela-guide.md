@@ -166,10 +166,10 @@ ANEXOS
 
 ## Histórico de Boletins Processados
 
-| Boletim | Data | Status | Arquivo de Sessão |
-|---------|------|--------|-------------------|
-| BOL037 | 02/03/2026 | ✅ Concluído | `SESSAO_BOL037_DIAGNOSTICO.md` |
-| BOL039 | 04/03/2026 | 🔄 Em andamento | `SESSAO_BOL039_DIAGNOSTICO.md` |
+| Boletim | Data | Status | Problemas Resolvidos |
+|---------|------|--------|----------------------|
+| BOL037 | 02/03/2026 | ✅ Concluído | Título multilinha, bold sem nome de fonte, tabelas de pessoal |
+| BOL039 | 04/03/2026 | ✅ Concluído | Subtítulos internos como notas órfãs, tabelas coluna única (MILITAR/DEMAIS FORÇAS/CIVIS), numeração `1)` em diretrizes, cabeçalho empilhado COESCI, RG partido, OBM multiline |
 
 ## Dicas para Novos Boletins
 

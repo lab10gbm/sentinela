@@ -13,7 +13,7 @@ const getAiClient = () => {
 /**
  * Função de Auditoria:
  * Analisa o RESULTADO da busca local + GABARITO (Correções do usuário) + TEXTO ORIGINAL.
- * Utiliza o modelo Gemini 3 Pro para raciocínio complexo sobre padrões de texto.
+ * Utiliza o modelo Gemini 2.0 Flash para raciocínio sobre padrões de texto.
  */
 export const auditLocalAnalysis = async (
   fullText: string,
@@ -44,7 +44,7 @@ export const auditLocalAnalysis = async (
     CORRECAO_HUMANA_SECAO: r.section && sectionCorrectionsMap[r.section] ? "O HUMANO CORRIGIU O CABEÇALHO DA SEÇÃO" : "Sem correção"
   }));
 
-  const textSample = fullText.slice(0, 50000); 
+  const textSample = fullText.slice(0, 50000);
 
   const prompt = `
     ATUE COMO UM ENGENHEIRO DE SOFTWARE SÊNIOR ESPECIALISTA EM REGEX E PARSER DE DOCUMENTOS.
@@ -74,11 +74,8 @@ export const auditLocalAnalysis = async (
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview", // Modelo de alta qualidade para tarefas complexas
+      model: "gemini-2.0-flash",
       contents: [{ parts: [{ text: prompt }] }],
-      config: {
-        thinkingConfig: { thinkingBudget: 4000 } // Habilita raciocínio detalhado para análise de código
-      }
     });
 
     return response.text || "Não foi possível gerar o relatório de auditoria.";
